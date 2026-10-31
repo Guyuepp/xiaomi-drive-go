@@ -61,6 +61,8 @@ func main() {
 		err = cmdSearch(ctx, args)
 	case "trash":
 		err = cmdTrash(ctx, args)
+	case "gallery", "photos":
+		err = cmdGallery(ctx, args)
 	case "help", "-h", "--help":
 		usage()
 	default:
@@ -100,6 +102,9 @@ func usage() {
   micloud link <路径>                      打印直链(24 小时有效)
   micloud search <关键词>                  全盘搜索
   micloud trash ls|restore <id>|purge <id>  回收站
+
+  micloud gallery <子命令>                  云相册:albums、ls、get、put、backup 等,
+                                          运行 micloud gallery help 查看
 
 凭据保存在 `+credPath()+`(权限 600)。
 `)
