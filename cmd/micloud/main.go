@@ -648,7 +648,11 @@ func cleanPath(p string) string {
 }
 
 func readLine() (string, error) {
-	r := bufio.NewReader(os.Stdin)
+	return readLineFrom(os.Stdin)
+}
+
+func readLineFrom(in io.Reader) (string, error) {
+	r := bufio.NewReader(in)
 	line, err := r.ReadString('\n')
 	if err != nil && err != io.EOF {
 		return "", err

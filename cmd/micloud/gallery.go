@@ -9,6 +9,7 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -20,8 +21,16 @@ import (
 
 const galleryUsage = `用法:
   micloud gallery albums                               列出相册
-  micloud gallery ls [相册] [--from 日期] [--to 日期] [--video]
+  micloud gallery ls [相册] [--from 日期] [--to 日期] [--video] [--name 子串]
                                                        列照片(默认总览;日期 YYYY-MM-DD,按东八区)
+                                                       --name 按文件名过滤(不区分大小写),不指定相册时
+                                                       连同私密相册一起列,照片多时要几分钟
+  micloud gallery search <关键词> [--pick 编号] [--limit 张数] [--unsorted]
+                                                       服务端搜索:分类、地点、时间、人物、相册名。
+                                                       不支持文件名和图片里的文字(文件名用 ls --name)。
+                                                       默认取完全部结果,按拍摄时间从新到旧显示前
+                                                       --limit 张(默认 100,0 表示全部);--unsorted
+                                                       按服务端顺序边取边显示,够数就停
   micloud gallery get <照片ID> [-o 输出]                下载照片或视频
   micloud gallery put <本地文件> <相册> [--name 名称] [--date "YYYY-MM-DD HH:MM:SS"]
                                                        上传到相册(默认按文件修改时间归档)
@@ -53,16 +62,34 @@ type galleryAPI interface {
 	Trash(ctx context.Context) ([]*xiaomidrive.Photo, error)
 	Restore(ctx context.Context, p *xiaomidrive.Photo) (*xiaomidrive.Photo, error)
 	Purge(ctx context.Context, id string) error
+	Suggest(ctx context.Context, query string) ([]*xiaomidrive.SearchSuggestion, error)
+	WalkSearch(ctx context.Context, s *xiaomidrive.SearchSuggestion, fn func(*xiaomidrive.Photo) error) error
 }
 
 var _ galleryAPI = (*xiaomidrive.Gallery)(nil)
 
 // galleryCmd runs gallery subcommands. Results go to out, progress and
-// warnings to errOut.
+// warnings to errOut. in is read for interactive choices when interactive is
+// set (stdin is a terminal).
 type galleryCmd struct {
-	g      galleryAPI
-	out    io.Writer
-	errOut io.Writer
+	g           galleryAPI
+	out         io.Writer
+	errOut      io.Writer
+	in          io.Reader
+	interactive bool
+}
+
+// stdinIsTerminal reports whether stdin is an interactive terminal. Pipes and
+// files are not character devices; /dev/null is, so it is ruled out by name.
+func stdinIsTerminal() bool {
+	fi, err := os.Stdin.Stat()
+	if err != nil || fi.Mode()&os.ModeCharDevice == 0 {
+		return false
+	}
+	if null, err := os.Stat(os.DevNull); err == nil && os.SameFile(fi, null) {
+		return false
+	}
+	return true
 }
 
 func cmdGallery(ctx context.Context, args []string) error {
@@ -77,7 +104,10 @@ func cmdGallery(ctx context.Context, args []string) error {
 	if err != nil {
 		return err
 	}
-	return (&galleryCmd{g: c.Gallery(), out: os.Stdout, errOut: os.Stderr}).run(ctx, args)
+	return (&galleryCmd{
+		g: c.Gallery(), out: os.Stdout, errOut: os.Stderr,
+		in: os.Stdin, interactive: stdinIsTerminal(),
+	}).run(ctx, args)
 }
 
 func (c *galleryCmd) run(ctx context.Context, args []string) error {
@@ -91,6 +121,8 @@ func (c *galleryCmd) run(ctx context.Context, args []string) error {
 		err = c.albums(ctx)
 	case "ls", "list":
 		err = c.ls(ctx, rest)
+	case "search":
+		err = c.search(ctx, rest)
 	case "get", "download":
 		err = c.get(ctx, rest)
 	case "put", "upload":
@@ -183,7 +215,8 @@ func parseDateTime(s string) (time.Time, error) {
 
 func (c *galleryCmd) ls(ctx context.Context, args []string) error {
 	var q xiaomidrive.PhotoQuery
-	var album string
+	var album, name string
+	nameSet := false
 	for i := 0; i < len(args); i++ {
 		switch args[i] {
 		case "--from":
@@ -202,12 +235,18 @@ func (c *galleryCmd) ls(ctx context.Context, args []string) error {
 			q.End = t
 		case "--video":
 			q.OnlyVideo = true
+		case "--name":
+			i++
+			name, nameSet = strings.TrimSpace(arg(args, i)), true
 		default:
 			if album != "" {
 				return fmt.Errorf("多余的参数 %q", args[i])
 			}
 			album = args[i]
 		}
+	}
+	if nameSet && name == "" {
+		return errors.New("--name 需要一个非空的子串")
 	}
 	if album != "" {
 		a, err := c.resolveAlbum(ctx, album)
@@ -216,14 +255,200 @@ func (c *galleryCmd) ls(ctx context.Context, args []string) error {
 		}
 		q.AlbumID = a.ID
 	}
-	return c.g.WalkPhotos(ctx, q, func(p *xiaomidrive.Photo) error {
-		kind := "img"
-		if p.IsVideo() {
-			kind = "vid"
+	emit := c.printPhoto
+	if nameSet {
+		needle := strings.ToLower(name)
+		emit = func(p *xiaomidrive.Photo) error {
+			if strings.Contains(strings.ToLower(p.Name), needle) {
+				return c.printPhoto(p)
+			}
+			return nil
 		}
-		fmt.Fprintf(c.out, "%-18s %s %s %10s  %s\n", p.ID, kind, p.Taken.In(xiaomidrive.GalleryZone).Format("2006-01-02 15:04"), humanBytes(p.Size), p.Name)
+	}
+	if err := c.g.WalkPhotos(ctx, q, emit); err != nil {
+		return err
+	}
+	// The overview leaves out the private album; a name search should not.
+	if nameSet && album == "" {
+		q.AlbumID = xiaomidrive.AlbumPrivate
+		return c.g.WalkPhotos(ctx, q, emit)
+	}
+	return nil
+}
+
+func (c *galleryCmd) printPhoto(p *xiaomidrive.Photo) error {
+	kind := "img"
+	if p.IsVideo() {
+		kind = "vid"
+	}
+	fmt.Fprintf(c.out, "%-18s %s %s %10s  %s\n", p.ID, kind, p.Taken.In(xiaomidrive.GalleryZone).Format("2006-01-02 15:04"), humanBytes(p.Size), p.Name)
+	return nil
+}
+
+// searchKindNames labels suggestion kinds for display.
+var searchKindNames = map[string]string{
+	xiaomidrive.SearchKindTag:      "分类",
+	xiaomidrive.SearchKindLocation: "地点",
+	xiaomidrive.SearchKindTime:     "时间",
+	xiaomidrive.SearchKindAlbum:    "相册",
+	xiaomidrive.SearchKindPeople:   "人物",
+}
+
+// defaultSearchLimit is how many photos a search shows unless --limit says
+// otherwise.
+const defaultSearchLimit = 100
+
+// errSearchLimit stops WalkSearch once enough photos were printed.
+var errSearchLimit = errors.New("search limit reached")
+
+// searchProgressEvery is how often (in photos) progress is shown while a
+// sorted search fetches everything; one service page is 100.
+const searchProgressEvery = 500
+
+func (c *galleryCmd) search(ctx context.Context, args []string) error {
+	var query string
+	pick, limit := 0, defaultSearchLimit
+	unsorted := false
+	for i := 0; i < len(args); i++ {
+		switch args[i] {
+		case "--pick":
+			i++
+			n, err := strconv.Atoi(arg(args, i))
+			if err != nil || n < 1 {
+				return errors.New("--pick 需要一个从 1 开始的编号")
+			}
+			pick = n
+		case "--limit":
+			i++
+			n, err := strconv.Atoi(arg(args, i))
+			if err != nil || n < 0 {
+				return errors.New("--limit 需要一个不小于 0 的整数(0 表示全部)")
+			}
+			limit = n
+		case "--unsorted":
+			unsorted = true
+		default:
+			if query != "" {
+				query += " "
+			}
+			query += args[i]
+		}
+	}
+	if strings.TrimSpace(query) == "" {
+		return errors.New("用法: micloud gallery search <关键词> [--pick 编号] [--limit 张数] [--unsorted]")
+	}
+
+	suggestions, err := c.g.Suggest(ctx, query)
+	if err != nil {
+		return err
+	}
+	if len(suggestions) == 0 {
+		fmt.Fprintln(c.out, "没有搜索结果。服务端搜索只认分类、地点、时间和相册名,不认文件名和图片里的文字;按文件名找请用 micloud gallery ls --name。")
+		return nil
+	}
+	for i, s := range suggestions {
+		kind := searchKindNames[s.Kind]
+		if kind == "" {
+			kind = s.Kind
+		}
+		count := ""
+		if s.Count > 0 {
+			count = fmt.Sprintf("(%d)", s.Count)
+		}
+		fmt.Fprintf(c.out, "%2d. [%s] %s%s\n", i+1, kind, s.Title, count)
+	}
+
+	if pick == 0 {
+		if !c.interactive {
+			fmt.Fprintln(c.errOut, "用 --pick <编号> 列出其中一项的照片。")
+			return nil
+		}
+		fmt.Fprint(c.errOut, "选择编号(直接回车退出): ")
+		line, err := readLineFrom(c.in)
+		if err != nil {
+			return err
+		}
+		line = strings.TrimSpace(line)
+		if line == "" {
+			return nil
+		}
+		n, err := strconv.Atoi(line)
+		if err != nil || n < 1 {
+			return fmt.Errorf("编号 %q 无效", line)
+		}
+		pick = n
+	}
+	if pick > len(suggestions) {
+		return fmt.Errorf("编号 %d 超出范围(共 %d 项)", pick, len(suggestions))
+	}
+
+	chosen := suggestions[pick-1]
+	fmt.Fprintf(c.out, "\n%s:\n", chosen.Title)
+	if unsorted {
+		return c.searchUnsorted(ctx, chosen, limit)
+	}
+	return c.searchSorted(ctx, chosen, limit)
+}
+
+// searchUnsorted prints photos in the service's order as they arrive and
+// stops fetching once limit photos are shown.
+func (c *galleryCmd) searchUnsorted(ctx context.Context, s *xiaomidrive.SearchSuggestion, limit int) error {
+	n := 0
+	err := c.g.WalkSearch(ctx, s, func(p *xiaomidrive.Photo) error {
+		if limit > 0 && n >= limit {
+			return errSearchLimit
+		}
+		n++
+		return c.printPhoto(p)
+	})
+	switch {
+	case errors.Is(err, errSearchLimit):
+		fmt.Fprintf(c.errOut, "已显示 %d 张(服务端顺序),用 --limit 调大或 --limit 0 显示全部。\n", limit)
+	case err != nil:
+		return err
+	case n == 0:
+		fmt.Fprintln(c.out, "(没有照片)")
+	}
+	return nil
+}
+
+// searchSorted fetches every photo (the service's order is not by date),
+// sorts newest first by the date the library files them under, and prints
+// the first limit.
+func (c *galleryCmd) searchSorted(ctx context.Context, s *xiaomidrive.SearchSuggestion, limit int) error {
+	var photos []*xiaomidrive.Photo
+	progress := false
+	err := c.g.WalkSearch(ctx, s, func(p *xiaomidrive.Photo) error {
+		photos = append(photos, p)
+		if len(photos)%searchProgressEvery == 0 {
+			progress = true
+			fmt.Fprintf(c.errOut, "\r正在获取… %d 张", len(photos))
+		}
 		return nil
 	})
+	if progress {
+		fmt.Fprintln(c.errOut)
+	}
+	if err != nil {
+		return err
+	}
+	if len(photos) == 0 {
+		fmt.Fprintln(c.out, "(没有照片)")
+		return nil
+	}
+	// Stable, so photos with the same date keep the service's order.
+	sort.SliceStable(photos, func(i, j int) bool { return photos[i].Taken.After(photos[j].Taken) })
+	shown := photos
+	if limit > 0 && len(shown) > limit {
+		shown = shown[:limit]
+	}
+	for _, p := range shown {
+		c.printPhoto(p)
+	}
+	if len(shown) < len(photos) {
+		fmt.Fprintf(c.errOut, "共 %d 张,已显示最新的 %d 张,用 --limit 调大或 --limit 0 显示全部。\n", len(photos), len(shown))
+	}
+	return nil
 }
 
 func (c *galleryCmd) get(ctx context.Context, args []string) error {

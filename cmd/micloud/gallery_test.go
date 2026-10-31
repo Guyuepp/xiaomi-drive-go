@@ -38,6 +38,12 @@ type fakeGallery struct {
 	uploadErr   error
 	deleteAlbum error
 
+	// Search.
+	suggestions   []*xiaomidrive.SearchSuggestion
+	suggestErr    error
+	searchResults map[string][]*xiaomidrive.Photo // by suggestion URL
+	searchSeen    int                             // photos handed to the callback
+
 	// Recorded calls.
 	walkQueries []xiaomidrive.PhotoQuery
 	libraryWalk int
@@ -174,6 +180,27 @@ func (f *fakeGallery) Restore(_ context.Context, p *xiaomidrive.Photo) (*xiaomid
 
 func (f *fakeGallery) Purge(_ context.Context, id string) error {
 	f.record("Purge %s", id)
+	return nil
+}
+
+func (f *fakeGallery) Suggest(_ context.Context, query string) ([]*xiaomidrive.SearchSuggestion, error) {
+	f.record("Suggest %s", query)
+	if f.suggestErr != nil {
+		return nil, f.suggestErr
+	}
+	return f.suggestions, nil
+}
+
+func (f *fakeGallery) WalkSearch(_ context.Context, s *xiaomidrive.SearchSuggestion, fn func(*xiaomidrive.Photo) error) error {
+	f.record("WalkSearch %s", s.Title)
+	for _, p := range f.searchResults[s.URL] {
+		f.mu.Lock()
+		f.searchSeen++
+		f.mu.Unlock()
+		if err := fn(p); err != nil {
+			return err
+		}
+	}
 	return nil
 }
 
@@ -833,4 +860,317 @@ func assertNoPart(t *testing.T, dir string) {
 		}
 		return nil
 	})
+}
+
+// ---------------------------------------------------------------------------
+// ls --name and search
+// ---------------------------------------------------------------------------
+
+func TestLsName(t *testing.T) {
+	g := &fakeGallery{albums: testAlbums}
+	g.photos = []*xiaomidrive.Photo{
+		{ID: "p1", AlbumID: "1", Name: "IMG_Beach_1.jpg"},
+		{ID: "p2", AlbumID: "a-trip", Name: "mountain.jpg"},
+		{ID: "p3", AlbumID: "a-trip", Name: "beach-2.PNG"},
+	}
+	g.private = []*xiaomidrive.Photo{{ID: "p4", AlbumID: xiaomidrive.AlbumPrivate, Name: "secret_beach.jpg"}}
+
+	out, _, err := run(t, g, "ls", "--name", "BEACH", "--video")
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, id := range []string{"p1", "p3", "p4"} {
+		if !strings.Contains(out, id+" ") {
+			t.Errorf("%s missing from:\n%s", id, out)
+		}
+	}
+	if strings.Contains(out, "p2") {
+		t.Errorf("non-matching photo listed:\n%s", out)
+	}
+	// Overview, then the private album, both with the other filters kept.
+	if len(g.walkQueries) != 2 || g.walkQueries[0].AlbumID != "" || g.walkQueries[1].AlbumID != xiaomidrive.AlbumPrivate ||
+		!g.walkQueries[0].OnlyVideo || !g.walkQueries[1].OnlyVideo {
+		t.Errorf("queries = %+v", g.walkQueries)
+	}
+
+	// With an album, only that album is walked.
+	g.walkQueries = nil
+	out, _, err = run(t, g, "ls", "trip", "--name", "beach")
+	if err != nil || len(g.walkQueries) != 1 || g.walkQueries[0].AlbumID != "a-trip" {
+		t.Errorf("album name search: err %v queries %+v", err, g.walkQueries)
+	}
+	if strings.TrimSpace(out) == "" || strings.Contains(out, "p4") || strings.Contains(out, "p2") {
+		t.Errorf("album name search output:\n%s", out)
+	}
+
+	for _, args := range [][]string{{"ls", "--name"}, {"ls", "--name", "  "}} {
+		if _, _, err := run(t, g, args...); err == nil {
+			t.Errorf("%q accepted", args)
+		}
+	}
+}
+
+func searchFixture(n int) *fakeGallery {
+	g := &fakeGallery{
+		suggestions: []*xiaomidrive.SearchSuggestion{
+			{Title: "风景", Kind: xiaomidrive.SearchKindTag, URL: "u-scenery"},
+			{Title: "广东省深圳市", Kind: xiaomidrive.SearchKindLocation, Count: 12, URL: "u-sz"},
+			{Title: "某种新类型", Kind: "mystery", URL: "u-x"},
+		},
+		searchResults: map[string][]*xiaomidrive.Photo{},
+	}
+	// Photos come back out of date order, like the real service: photo i
+	// was taken (i*37 mod n) days after base, so s000 is not the newest.
+	base := time.Date(2020, 1, 1, 12, 0, 0, 0, xiaomidrive.GalleryZone)
+	for i := 0; i < n; i++ {
+		g.searchResults["u-scenery"] = append(g.searchResults["u-scenery"],
+			&xiaomidrive.Photo{ID: fmt.Sprintf("s%03d", i), Name: fmt.Sprintf("view%03d.jpg", i), Taken: base.AddDate(0, 0, i*37%n)})
+	}
+	g.searchResults["u-sz"] = []*xiaomidrive.Photo{{ID: "z1", Name: "sz.jpg"}}
+	return g
+}
+
+func TestSearchListsSuggestions(t *testing.T) {
+	g := searchFixture(3)
+	out, stderr, err := run(t, g, "search", "风", "景")
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := []string{" 1. [分类] 风景", " 2. [地点] 广东省深圳市(12)", " 3. [mystery] 某种新类型"}
+	for _, w := range want {
+		if !strings.Contains(out, w+"\n") {
+			t.Errorf("missing %q in:\n%s", w, out)
+		}
+	}
+	// Non-interactive without --pick: list only, no photo lookup.
+	if !strings.Contains(stderr, "--pick") {
+		t.Errorf("no hint: %q", stderr)
+	}
+	if strings.Join(g.calls, "|") != "Suggest 风 景" {
+		t.Errorf("calls = %q", g.calls)
+	}
+}
+
+func TestSearchPick(t *testing.T) {
+	g := searchFixture(3)
+	out, _, err := run(t, g, "search", "深圳", "--pick", "2")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(out, "广东省深圳市:\n") || !strings.Contains(out, "z1 ") || strings.Contains(out, "s000") {
+		t.Errorf("output:\n%s", out)
+	}
+	if g.calls[1] != "WalkSearch 广东省深圳市" {
+		t.Errorf("calls = %q", g.calls)
+	}
+
+	for _, args := range [][]string{
+		{"search", "x", "--pick", "4"}, {"search", "x", "--pick", "0"}, {"search", "x", "--pick", "a"},
+		{"search", "x", "--limit", "-1"}, {"search"}, {"search", "--pick", "1"},
+	} {
+		if _, _, err := run(t, searchFixture(1), args...); err == nil {
+			t.Errorf("%q accepted", args)
+		}
+	}
+}
+
+// photoLines returns the photo IDs printed in out, in order.
+func photoLines(out string) []string {
+	var ids []string
+	for _, line := range strings.Split(out, "\n") {
+		f := strings.Fields(line)
+		if len(f) >= 2 && (f[1] == "img" || f[1] == "vid") {
+			ids = append(ids, f[0])
+		}
+	}
+	return ids
+}
+
+func TestSearchSortedByDate(t *testing.T) {
+	g := searchFixture(250)
+	photos := g.searchResults["u-scenery"]
+	takenOf := map[string]time.Time{}
+	for _, p := range photos {
+		takenOf[p.ID] = p.Taken
+	}
+
+	// Default: fetch everything, show the newest 100, newest first.
+	out, stderr, err := run(t, g, "search", "风景", "--pick", "1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	ids := photoLines(out)
+	if len(ids) != 100 {
+		t.Fatalf("printed %d photos, want 100", len(ids))
+	}
+	if g.searchSeen != 250 {
+		t.Errorf("fetched %d photos, want all 250 before sorting", g.searchSeen)
+	}
+	newest := newestIDs(photos, 100)
+	for i, id := range ids {
+		if id != newest[i] {
+			t.Fatalf("position %d: %s (taken %s), want %s", i, id, takenOf[id].Format("2006-01-02"), newest[i])
+		}
+	}
+	if !strings.Contains(stderr, "共 250 张,已显示最新的 100 张") {
+		t.Errorf("stderr %q", stderr)
+	}
+
+	// --limit 0 shows all, still sorted, without the "more" note.
+	g = searchFixture(250)
+	out, stderr, _ = run(t, g, "search", "风景", "--pick", "1", "--limit", "0")
+	ids = photoLines(out)
+	if len(ids) != 250 || strings.Contains(stderr, "已显示最新") {
+		t.Errorf("--limit 0: %d photos, stderr %q", len(ids), stderr)
+	}
+	for i := 1; i < len(ids); i++ {
+		if takenOf[ids[i]].After(takenOf[ids[i-1]]) {
+			t.Fatalf("not newest first at %d", i)
+		}
+	}
+
+	// Exactly the limit: no note.
+	_, stderr, _ = run(t, searchFixture(5), "search", "风景", "--pick", "1", "--limit", "5")
+	if strings.Contains(stderr, "已显示") {
+		t.Errorf("note shown though nothing was cut: %q", stderr)
+	}
+}
+
+// newestIDs returns the IDs of the n newest photos, newest first.
+func newestIDs(photos []*xiaomidrive.Photo, n int) []string {
+	sorted := append([]*xiaomidrive.Photo{}, photos...)
+	for i := 1; i < len(sorted); i++ {
+		for j := i; j > 0 && sorted[j].Taken.After(sorted[j-1].Taken); j-- {
+			sorted[j], sorted[j-1] = sorted[j-1], sorted[j]
+		}
+	}
+	ids := make([]string, 0, n)
+	for _, p := range sorted[:n] {
+		ids = append(ids, p.ID)
+	}
+	return ids
+}
+
+func TestSearchSortedProgress(t *testing.T) {
+	_, stderr, err := run(t, searchFixture(1200), "search", "风景", "--pick", "1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(stderr, "正在获取… 500 张") || !strings.Contains(stderr, "正在获取… 1000 张") {
+		t.Errorf("no progress for a large result: %q", stderr)
+	}
+	_, stderr, _ = run(t, searchFixture(250), "search", "风景", "--pick", "1")
+	if strings.Contains(stderr, "正在获取") {
+		t.Errorf("progress shown for a small result: %q", stderr)
+	}
+}
+
+func TestSearchUnsorted(t *testing.T) {
+	// Service order as it arrives, and the walk stops right after the limit.
+	g := searchFixture(250)
+	out, stderr, err := run(t, g, "search", "风景", "--pick", "1", "--unsorted")
+	if err != nil {
+		t.Fatal(err)
+	}
+	ids := photoLines(out)
+	if len(ids) != 100 || ids[0] != "s000" || ids[99] != "s099" {
+		t.Errorf("unsorted: %d photos, first %v", len(ids), ids[:min(len(ids), 3)])
+	}
+	if g.searchSeen != 101 || !strings.Contains(stderr, "已显示 100 张(服务端顺序)") {
+		t.Errorf("walk not stopped at the limit: seen %d, stderr %q", g.searchSeen, stderr)
+	}
+
+	g = searchFixture(250)
+	out, stderr, _ = run(t, g, "search", "风景", "--pick", "1", "--unsorted", "--limit", "0")
+	if got := len(photoLines(out)); got != 250 || strings.Contains(stderr, "已显示") {
+		t.Errorf("--unsorted --limit 0 printed %d, stderr %q", got, stderr)
+	}
+
+	g = searchFixture(1)
+	g.searchResults["u-scenery"] = nil
+	if out, _, err := run(t, g, "search", "风景", "--pick", "1", "--unsorted"); err != nil || !strings.Contains(out, "(没有照片)") {
+		t.Errorf("empty unsorted: %v %q", err, out)
+	}
+}
+
+func interactiveRun(t *testing.T, g *fakeGallery, input string, args ...string) (string, string, error) {
+	t.Helper()
+	var out, errOut bytes.Buffer
+	c := &galleryCmd{g: g, out: &out, errOut: &errOut, in: strings.NewReader(input), interactive: true}
+	err := c.run(context.Background(), args)
+	return out.String(), errOut.String(), err
+}
+
+func TestSearchInteractive(t *testing.T) {
+	g := searchFixture(2)
+	out, stderr, err := interactiveRun(t, g, "1\n", "search", "风景")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(stderr, "选择编号") || !strings.Contains(out, "s000 ") || !strings.Contains(out, "s001 ") {
+		t.Errorf("stdout:\n%s\nstderr: %q", out, stderr)
+	}
+
+	// Empty answer exits without looking anything up.
+	g = searchFixture(2)
+	if _, _, err := interactiveRun(t, g, "\n", "search", "风景"); err != nil || len(g.calls) != 1 {
+		t.Errorf("empty answer: err %v calls %q", err, g.calls)
+	}
+	if _, _, err := interactiveRun(t, searchFixture(2), "x\n", "search", "风景"); err == nil {
+		t.Error("bad choice accepted")
+	}
+	if _, _, err := interactiveRun(t, searchFixture(2), "9\n", "search", "风景"); err == nil {
+		t.Error("out-of-range choice accepted")
+	}
+	// --pick skips the prompt even on a terminal.
+	_, stderr, _ = interactiveRun(t, searchFixture(2), "", "search", "风景", "--pick", "1")
+	if strings.Contains(stderr, "选择编号") {
+		t.Errorf("prompted despite --pick: %q", stderr)
+	}
+}
+
+func TestSearchNoResultsAndErrors(t *testing.T) {
+	g := &fakeGallery{}
+	out, _, err := run(t, g, "search", "IMG_1234")
+	if err != nil || !strings.Contains(out, "没有搜索结果") || !strings.Contains(out, "ls --name") {
+		t.Errorf("no results: %v %q", err, out)
+	}
+
+	g = searchFixture(1)
+	g.searchResults["u-scenery"] = nil
+	out, _, err = run(t, g, "search", "风景", "--pick", "1")
+	if err != nil || !strings.Contains(out, "(没有照片)") {
+		t.Errorf("empty suggestion: %v %q", err, out)
+	}
+
+	g = &fakeGallery{suggestErr: xiaomidrive.ErrBlocked}
+	if _, _, err := run(t, g, "search", "风景"); !errors.Is(err, xiaomidrive.ErrBlocked) || !strings.Contains(err.Error(), "过一段时间再试") {
+		t.Errorf("blocked: %v", err)
+	}
+}
+
+func TestStdinIsTerminal(t *testing.T) {
+	orig := os.Stdin
+	defer func() { os.Stdin = orig }()
+
+	null, err := os.Open(os.DevNull)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer null.Close()
+	os.Stdin = null
+	if stdinIsTerminal() {
+		t.Error("/dev/null treated as a terminal")
+	}
+
+	r, w, err := os.Pipe()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer r.Close()
+	defer w.Close()
+	os.Stdin = r
+	if stdinIsTerminal() {
+		t.Error("pipe treated as a terminal")
+	}
 }
