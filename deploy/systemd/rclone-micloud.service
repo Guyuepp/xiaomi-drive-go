@@ -1,0 +1,23 @@
+[Unit]
+Description=Mount Xiaomi Cloud Drive at ~/MiCloud (rclone via OpenList WebDAV)
+After=openlist.service network-online.target
+Requires=openlist.service
+
+[Service]
+Type=notify
+ExecStartPre=/usr/bin/mkdir -p %h/MiCloud
+ExecStart=/usr/bin/rclone mount micloud: %h/MiCloud \
+  --vfs-cache-mode full \
+  --vfs-cache-max-size 10G \
+  --vfs-cache-max-age 24h \
+  --vfs-read-chunk-size 16M \
+  --buffer-size 32M \
+  --dir-cache-time 1m \
+  --cache-dir %h/.cache/rclone \
+  --log-level NOTICE
+ExecStop=/usr/bin/fusermount3 -u %h/MiCloud
+Restart=on-failure
+RestartSec=10
+
+[Install]
+WantedBy=default.target

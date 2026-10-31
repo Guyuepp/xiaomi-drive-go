@@ -105,6 +105,20 @@ scripts/build-openlist.sh && systemctl --user restart openlist   # 改了库或�
 
 用户服务只在登录期间运行。需要开机即运行(不登录也运行)时执行 `sudo loginctl enable-linger $USER`。
 
+### 挂载到 `~/MiCloud`
+
+rclone 通过 OpenList 的 WebDAV 挂载,服务文件是 `~/.config/systemd/user/rclone-micloud.service`(仓库里 `deploy/systemd/` 有副本)。
+
+- rclone 使用单独的 OpenList 用户 `rclone`:只能访问 `/micloud`,只有上传、新建目录、重命名、移动、复制、删除和 WebDAV 权限。它的密码只存在 `~/.config/rclone/rclone.conf`(权限 600,rclone 的 obscure 只是混淆,不是加密)。
+- 开启了 `--vfs-cache-mode full`:写入先进本地缓存 `~/.cache/rclone`,关闭文件后后台上传;缓存上限 10G,保留 24 小时。
+- **空文件不会上传**:`touch` 之类产生的 0 字节文件只存在于本地缓存,rclone 会不断重试并在日志里报 405,写入内容后才会真正上传。
+
+```
+systemctl --user status rclone-micloud
+journalctl --user -u rclone-micloud -f
+systemctl --user restart rclone-micloud     # 重新挂载
+```
+
 ## 安全
 
 - `passToken`(约 30 天、滚动续期)权限远高于 `serviceToken`(约 15 分钟)。只用 0600 文件或系统钥匙串保存,任何日志都不得出现。
