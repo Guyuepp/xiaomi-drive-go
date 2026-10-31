@@ -30,7 +30,7 @@ func (g *Gallery) resolveDownload(ctx context.Context, id string) (*galleryTarge
 		return nil, err
 	}
 	q := url.Values{"id": {id}, "callBack": {galleryJSONPCallback}}
-	raw, err := g.c.s.get(ctx, "/gallery/storage", q)
+	raw, err := g.get(ctx, "/gallery/storage", q)
 	if err != nil {
 		return nil, err
 	}

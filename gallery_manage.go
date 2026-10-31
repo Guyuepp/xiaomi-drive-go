@@ -153,7 +153,7 @@ func (g *Gallery) Trash(ctx context.Context) ([]*Photo, error) {
 	maxTag := "0"
 	for {
 		q := url.Values{"_dc": {nowMillis()}, "maxTag": {maxTag}, "limit": {strconv.Itoa(trashPageLimit)}}
-		raw, err := g.c.s.get(ctx, "/gallery/deleted_v2", q)
+		raw, err := g.get(ctx, "/gallery/deleted_v2", q)
 		if err != nil {
 			return nil, err
 		}

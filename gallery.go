@@ -39,12 +39,53 @@ type Gallery struct {
 
 	mu    sync.Mutex
 	ready bool
+
+	// blockMu guards blockedUntil: after a "user is blocked" (503) answer,
+	// gallery reads fail locally until then instead of reaching the service.
+	blockMu      sync.Mutex
+	blockedUntil time.Time
+	now          func() time.Time
 }
+
+// galleryBlockCooldown is how long gallery reads are held back after the
+// service blocks them. Observed blocks lifted after 3 to 4 minutes.
+const galleryBlockCooldown = 5 * time.Minute
 
 // Gallery returns the client's photo library.
 func (c *Client) Gallery() *Gallery {
-	c.galleryOnce.Do(func() { c.gallery = &Gallery{c: c} })
+	c.galleryOnce.Do(func() { c.gallery = &Gallery{c: c, now: time.Now} })
 	return c.gallery
+}
+
+// get is Session.get for gallery reads, with the block cooldown. Writes are
+// not held back: during an observed block, uploads and moves still worked.
+func (g *Gallery) get(ctx context.Context, path string, q url.Values) (json.RawMessage, error) {
+	if err := g.checkBlocked(); err != nil {
+		return nil, err
+	}
+	raw, err := g.c.s.get(ctx, path, q)
+	g.noteBlocked(err)
+	return raw, err
+}
+
+// checkBlocked returns ErrBlocked while a cooldown is running.
+func (g *Gallery) checkBlocked() error {
+	g.blockMu.Lock()
+	defer g.blockMu.Unlock()
+	if until := g.blockedUntil; !until.IsZero() && g.now().Before(until) {
+		return fmt.Errorf("%w (held back locally until %s)", ErrBlocked, until.Format("15:04:05"))
+	}
+	return nil
+}
+
+// noteBlocked starts a cooldown if err says the service blocked us.
+func (g *Gallery) noteBlocked(err error) {
+	if err == nil || !errors.Is(err, ErrBlocked) {
+		return
+	}
+	g.blockMu.Lock()
+	g.blockedUntil = g.now().Add(galleryBlockCooldown)
+	g.blockMu.Unlock()
 }
 
 // ensure runs the one-time startup the web client does before using the
@@ -73,7 +114,7 @@ func (g *Gallery) ensure(ctx context.Context) error {
 // skipped rather than blocking the gallery.
 func (g *Gallery) checkE2EE(ctx context.Context) error {
 	q := url.Values{"hsid": {"2"}, "appId": {"micloud"}}
-	raw, err := g.c.s.get(ctx, "/mic/keybag/v1/getEncInfo", q)
+	raw, err := g.get(ctx, "/mic/keybag/v1/getEncInfo", q)
 	if err != nil {
 		if errors.Is(err, ErrUnauthorized) || ctx.Err() != nil {
 			return err
@@ -277,7 +318,7 @@ func (g *Gallery) Albums(ctx context.Context) ([]*Album, error) {
 			"isShared":        {"false"},
 			"numOfThumbnails": {"1"},
 		}
-		raw, err := g.c.s.get(ctx, "/gallery/user/album/list", q)
+		raw, err := g.get(ctx, "/gallery/user/album/list", q)
 		if err != nil {
 			return nil, err
 		}
@@ -304,7 +345,7 @@ func (g *Gallery) VideoCount(ctx context.Context) (int, error) {
 	if err := g.ensure(ctx); err != nil {
 		return 0, err
 	}
-	raw, err := g.c.s.get(ctx, "/gallery/user/album/video", url.Values{"isShared": {"false"}})
+	raw, err := g.get(ctx, "/gallery/user/album/video", url.Values{"isShared": {"false"}})
 	if err != nil {
 		return 0, err
 	}
@@ -369,7 +410,7 @@ func (g *Gallery) Timeline(ctx context.Context, q PhotoQuery) (map[string]int, e
 	if q.OnlyVideo {
 		v.Set("onlyVideo", "true")
 	}
-	raw, err := g.c.s.get(ctx, "/gallery/user/timeline", v)
+	raw, err := g.get(ctx, "/gallery/user/timeline", v)
 	if err != nil {
 		return nil, err
 	}
@@ -400,7 +441,7 @@ func (g *Gallery) WalkPhotos(ctx context.Context, q PhotoQuery, fn func(*Photo) 
 		}
 		v.Set("pageNum", strconv.Itoa(page))
 		v.Set("pageSize", strconv.Itoa(galleryPageSize))
-		raw, err := g.c.s.get(ctx, "/gallery/user/galleries", v)
+		raw, err := g.get(ctx, "/gallery/user/galleries", v)
 		if err != nil {
 			return err
 		}
