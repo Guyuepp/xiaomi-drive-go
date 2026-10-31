@@ -67,7 +67,25 @@ files, _ := c.List(ctx, micloud.Root())
 
 ## 接入 OpenList
 
-`driver/` 是一个只依赖核心库的参考适配器,方法体与真实 OpenList 驱动一致。接入时把该文件复制到 OpenList 的 `drivers/micloud/`,将本地的 `Obj` / `Link` 换成 `model.Obj` / `model.Link`,补上 `Additional`(保存 `passToken` 等)与 `Config` 样板即可。文件以服务端 ID 标识(`Obj.GetID()` 直接回传给客户端)。
+驱动在 OpenList 的 fork 里(`openlist/` 目录,`micloud` 分支,`drivers/micloud/`),通过 `go.mod` 里的 `replace github.com/Guyuepp/micloud => ../` 引用本库。
+
+```
+cd openlist
+# 首次需要前端页面(与官方 build.sh 相同的来源)
+gh release download v4.2.9 -R OpenListTeam/OpenList-Frontend -p 'openlist-frontend-dist-v4.2.9.tar.gz'
+tar -xzf openlist-frontend-dist-v4.2.9.tar.gz -C public/dist
+go build -o openlist .
+```
+
+添加存储:驱动选 `MiCloud`,`user_id` 和 `pass_token` 用 `micloud login qr` 登录后执行 `micloud export` 获得。根目录 ID 默认 `0`。
+
+- 续期得到的 `serviceToken` 自动写回 OpenList 数据库;重启后先用 `pass_token` 换新令牌。
+- 覆盖上传由 OpenList 先把旧文件改名为 `*.openlist_to_delete`,上传成功后删除(`NoOverwriteUpload`)。
+- 移动到已有同名项的目录时直接报错,而不是让服务端自动改名为 `name(1)`。
+- OpenList 默认隐藏容量(`hide_storage_details`),需要在设置里关闭才会显示。
+- 通过 WebDAV 覆盖文件时,OpenList 会额外做一份服务端备份再删除,所以每次覆盖会往回收站里多放一两个文件。
+
+`driver/` 目录是早期的无依赖示意版本,真实驱动以 fork 里的为准。
 
 ## 安全
 
