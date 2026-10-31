@@ -1,4 +1,4 @@
-package micloud
+package xiaomidrive
 
 import (
 	"context"
@@ -24,7 +24,7 @@ func (c *Client) TrashList(ctx context.Context) ([]TrashItem, error) {
 			List    []rawRecord `json:"list"`
 		}
 		if err := json.Unmarshal(raw, &d); err != nil {
-			return nil, fmt.Errorf("micloud: trash decode: %w", err)
+			return nil, fmt.Errorf("xiaomidrive: trash decode: %w", err)
 		}
 		for i := range d.List {
 			r := &d.List[i]

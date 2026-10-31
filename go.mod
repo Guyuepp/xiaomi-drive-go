@@ -1,4 +1,4 @@
-module github.com/Guyuepp/micloud
+module github.com/Guyuepp/xiaomi-drive-go
 
 go 1.24
 

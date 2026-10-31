@@ -1,4 +1,4 @@
-package micloud
+package xiaomidrive
 
 import (
 	"context"
@@ -89,7 +89,7 @@ func (c *Client) listPage(ctx context.Context, dir *File, pageNo int, opts ListO
 	}
 	var d listData
 	if err := json.Unmarshal(raw, &d); err != nil {
-		return nil, false, fmt.Errorf("micloud: list decode: %w", err)
+		return nil, false, fmt.Errorf("xiaomidrive: list decode: %w", err)
 	}
 	out := make([]*File, 0, len(d.Records))
 	for i := range d.Records {
@@ -109,7 +109,7 @@ func (c *Client) Get(ctx context.Context, id string) (*File, error) {
 	}
 	var rec rawRecord
 	if err := json.Unmarshal(raw, &rec); err != nil {
-		return nil, fmt.Errorf("micloud: get decode: %w", err)
+		return nil, fmt.Errorf("xiaomidrive: get decode: %w", err)
 	}
 	if rec.ID == "" {
 		rec.ID = flexString(id)
@@ -132,7 +132,7 @@ func (c *Client) DirPath(ctx context.Context, id string) (string, error) {
 		Path string `json:"path"`
 	}
 	if err := json.Unmarshal(raw, &d); err != nil {
-		return "", fmt.Errorf("micloud: dir path decode: %w", err)
+		return "", fmt.Errorf("xiaomidrive: dir path decode: %w", err)
 	}
 	return d.Path, nil
 }
@@ -182,7 +182,7 @@ func (c *Client) MakeDir(ctx context.Context, parentID, name string) (*File, err
 	}
 	var rec rawRecord
 	if err := json.Unmarshal(raw, &rec); err != nil {
-		return nil, fmt.Errorf("micloud: mkdir decode: %w", err)
+		return nil, fmt.Errorf("xiaomidrive: mkdir decode: %w", err)
 	}
 	f := rec.toFile(nil)
 	if f.Type == "" {
@@ -235,7 +235,7 @@ func (c *Client) Search(ctx context.Context, query string, opts SearchOptions) (
 		}
 		var d listData
 		if err := json.Unmarshal(raw, &d); err != nil {
-			return nil, fmt.Errorf("micloud: search decode: %w", err)
+			return nil, fmt.Errorf("xiaomidrive: search decode: %w", err)
 		}
 		for i := range d.Records {
 			out = append(out, d.Records[i].toFile(nil))
@@ -259,7 +259,7 @@ func (c *Client) Quota(ctx context.Context) (*Quota, error) {
 		UsedDetail map[string]quotaDetail `json:"usedDetail"`
 	}
 	if err := json.Unmarshal(raw, &d); err != nil {
-		return nil, fmt.Errorf("micloud: quota decode: %w", err)
+		return nil, fmt.Errorf("xiaomidrive: quota decode: %w", err)
 	}
 	q := &Quota{Total: int64(d.TotalQuota), Used: int64(d.Used), UsedDetail: map[string]int64{}}
 	for k, v := range d.UsedDetail {

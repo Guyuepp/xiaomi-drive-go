@@ -1,4 +1,4 @@
-package micloud
+package xiaomidrive
 
 import (
 	"crypto/aes"
@@ -69,7 +69,7 @@ func rsaEncryptPKCS1v15(pubB64 string, plain []byte) ([]byte, error) {
 	}
 	rsaPub, ok := pub.(*rsa.PublicKey)
 	if !ok {
-		return nil, errors.New("micloud: login key is not RSA")
+		return nil, errors.New("xiaomidrive: login key is not RSA")
 	}
 	return rsa.EncryptPKCS1v15(rand.Reader, rsaPub, plain)
 }
@@ -90,13 +90,13 @@ func encryptLoginField(fieldName, value string) (eui, encrypted string, err erro
 	}
 	ct, err := aesCBCEncrypt([]byte(k), loginIV, []byte(value))
 	if err != nil {
-		return "", "", fmt.Errorf("micloud: aes: %w", err)
+		return "", "", fmt.Errorf("xiaomidrive: aes: %w", err)
 	}
 	encrypted = base64.StdEncoding.EncodeToString(ct)
 
 	rsaOut, err := rsaEncryptPKCS1v15(loginPublicKey, []byte(base64.StdEncoding.EncodeToString([]byte(k))))
 	if err != nil {
-		return "", "", fmt.Errorf("micloud: rsa: %w", err)
+		return "", "", fmt.Errorf("xiaomidrive: rsa: %w", err)
 	}
 	eui = base64.StdEncoding.EncodeToString(rsaOut) + "." +
 		base64.StdEncoding.EncodeToString([]byte(fieldName))

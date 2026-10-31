@@ -1,4 +1,4 @@
-package micloud
+package xiaomidrive
 
 import (
 	"context"
@@ -73,7 +73,7 @@ func (c *Client) fileManager(ctx context.Context, op string, recs []operateRecor
 		Interval flexInt `json:"interval"`
 	}
 	if err := json.Unmarshal(raw, &d); err != nil {
-		return fmt.Errorf("micloud: %s decode: %w", op, err)
+		return fmt.Errorf("xiaomidrive: %s decode: %w", op, err)
 	}
 	interval := time.Duration(d.Interval) * time.Millisecond
 	if interval <= 0 {
@@ -111,7 +111,7 @@ func (c *Client) waitTask(ctx context.Context, op, taskID string, interval time.
 		}
 		var t taskResult
 		if err := json.Unmarshal(raw, &t); err != nil {
-			return fmt.Errorf("micloud: %s task decode: %w", op, err)
+			return fmt.Errorf("xiaomidrive: %s task decode: %w", op, err)
 		}
 		switch t.Status {
 		case "SUCCESS":
@@ -123,7 +123,7 @@ func (c *Client) waitTask(ctx context.Context, op, taskID string, interval time.
 			return taskErrorFrom(op, taskID, &t)
 		}
 		if time.Now().After(deadline) {
-			return fmt.Errorf("micloud: %s task %s timed out", op, taskID)
+			return fmt.Errorf("xiaomidrive: %s task %s timed out", op, taskID)
 		}
 		select {
 		case <-ctx.Done():

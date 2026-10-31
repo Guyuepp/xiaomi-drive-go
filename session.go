@@ -1,4 +1,4 @@
-package micloud
+package xiaomidrive
 
 import (
 	"context"
@@ -174,7 +174,7 @@ func (s *Session) setCredentials(c Credentials) {
 	snapshot := s.creds
 	s.mu.Unlock()
 	if err := s.store.Save(&snapshot); err != nil {
-		s.logf("micloud: save credentials: %v", err)
+		s.logf("xiaomidrive: save credentials: %v", err)
 	}
 }
 
@@ -191,7 +191,7 @@ func (s *Session) updateServiceToken(token, userID string) {
 	snapshot := s.creds
 	s.mu.Unlock()
 	if err := s.store.Save(&snapshot); err != nil {
-		s.logf("micloud: save credentials: %v", err)
+		s.logf("xiaomidrive: save credentials: %v", err)
 	}
 }
 
@@ -325,7 +325,7 @@ func (s *Session) callOnce(ctx context.Context, method, path string, query, form
 	var env apiEnvelope
 	if len(body) > 0 {
 		if jerr := json.Unmarshal(stripStart(body), &env); jerr != nil && resp.StatusCode == http.StatusOK {
-			return nil, resp.StatusCode, fmt.Errorf("micloud: %s: decode response: %w", path, jerr)
+			return nil, resp.StatusCode, fmt.Errorf("xiaomidrive: %s: decode response: %w", path, jerr)
 		}
 	}
 	return &env, resp.StatusCode, nil
@@ -374,7 +374,7 @@ func (s *Session) refreshLocked(ctx context.Context) error {
 		Desc           string `json:"desc"`
 	}
 	if jerr := json.Unmarshal(stripStart(body), &r); jerr != nil {
-		return fmt.Errorf("micloud: restore: decode: %w", jerr)
+		return fmt.Errorf("xiaomidrive: restore: decode: %w", jerr)
 	}
 	// Success requires code==0 AND securityStatus==0; a failure response also
 	// carries a location (to the login page), so location alone is not enough.
@@ -410,7 +410,7 @@ func (s *Session) StartKeepAlive(ctx context.Context) {
 					return
 				case <-t.C:
 					if err := s.renew(ctx); err != nil {
-						s.logf("micloud: keepalive: %v", err)
+						s.logf("xiaomidrive: keepalive: %v", err)
 					}
 				}
 			}

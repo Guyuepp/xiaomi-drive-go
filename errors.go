@@ -1,4 +1,4 @@
-package micloud
+package xiaomidrive
 
 import (
 	"errors"
@@ -11,33 +11,33 @@ import (
 var (
 	// ErrUnauthorized means the session is gone and could not be restored
 	// silently. The user has to log in again.
-	ErrUnauthorized = errors.New("micloud: not logged in or session expired")
+	ErrUnauthorized = errors.New("xiaomidrive: not logged in or session expired")
 	// ErrNotFound means the file, folder or trash item does not exist (11002).
-	ErrNotFound = errors.New("micloud: not found")
+	ErrNotFound = errors.New("xiaomidrive: not found")
 	// ErrExist means another item already uses the name (11005).
-	ErrExist = errors.New("micloud: name already exists")
+	ErrExist = errors.New("xiaomidrive: name already exists")
 	// ErrInvalidName means the name breaks the service's naming rules (10002).
-	ErrInvalidName = errors.New("micloud: invalid name")
+	ErrInvalidName = errors.New("xiaomidrive: invalid name")
 	// ErrInvalidArgument means a request parameter was rejected (10008, 10016, -1).
-	ErrInvalidArgument = errors.New("micloud: invalid argument")
+	ErrInvalidArgument = errors.New("xiaomidrive: invalid argument")
 	// ErrEmptyFile is returned for 0-byte uploads; the service cannot store them.
-	ErrEmptyFile = errors.New("micloud: empty files cannot be uploaded")
+	ErrEmptyFile = errors.New("xiaomidrive: empty files cannot be uploaded")
 	// ErrIntoSelf means a folder was moved or copied into itself (11010).
-	ErrIntoSelf = errors.New("micloud: cannot move or copy a folder into itself")
+	ErrIntoSelf = errors.New("xiaomidrive: cannot move or copy a folder into itself")
 	// ErrSameFolder means an item was copied into its own parent (11003).
-	ErrSameFolder = errors.New("micloud: cannot copy into the same folder")
+	ErrSameFolder = errors.New("xiaomidrive: cannot copy into the same folder")
 	// ErrNotDir is returned when a folder was expected.
-	ErrNotDir = errors.New("micloud: not a folder")
+	ErrNotDir = errors.New("xiaomidrive: not a folder")
 	// ErrIsDir is returned when a file was expected.
-	ErrIsDir = errors.New("micloud: is a folder")
+	ErrIsDir = errors.New("xiaomidrive: is a folder")
 
 	// ErrQRExpired means the QR code timed out before it was confirmed.
-	ErrQRExpired = errors.New("micloud: QR code expired")
+	ErrQRExpired = errors.New("xiaomidrive: QR code expired")
 	// ErrCaptchaRequired means the account site asked for a captcha.
-	ErrCaptchaRequired = errors.New("micloud: captcha required")
+	ErrCaptchaRequired = errors.New("xiaomidrive: captcha required")
 	// ErrVerificationRequired means the account site asked for an extra
 	// verification step that must be completed in a browser.
-	ErrVerificationRequired = errors.New("micloud: additional verification required")
+	ErrVerificationRequired = errors.New("xiaomidrive: additional verification required")
 )
 
 // Service error codes observed on i.mi.com.
@@ -87,7 +87,7 @@ type APIError struct {
 
 func (e *APIError) Error() string {
 	var b strings.Builder
-	fmt.Fprintf(&b, "micloud: %s: ", e.Endpoint)
+	fmt.Fprintf(&b, "xiaomidrive: %s: ", e.Endpoint)
 	if e.HTTPStatus == 401 {
 		b.WriteString("unauthorized")
 		return b.String()
@@ -154,9 +154,9 @@ func (e *TaskError) Error() string {
 		if msg == "" {
 			msg = codeText(f.Code)
 		}
-		return fmt.Sprintf("micloud: %s: %d item(s) failed, first %q: code %d %s", strings.ToLower(e.Op), len(e.Failed), who, f.Code, msg)
+		return fmt.Sprintf("xiaomidrive: %s: %d item(s) failed, first %q: code %d %s", strings.ToLower(e.Op), len(e.Failed), who, f.Code, msg)
 	}
-	return fmt.Sprintf("micloud: %s: task failed: code %d %s", strings.ToLower(e.Op), e.Code, e.Message)
+	return fmt.Sprintf("xiaomidrive: %s: task failed: code %d %s", strings.ToLower(e.Op), e.Code, e.Message)
 }
 
 func (e *TaskError) Is(target error) bool {
@@ -187,7 +187,7 @@ type LoginError struct {
 }
 
 func (e *LoginError) Error() string {
-	msg := fmt.Sprintf("micloud: login (%s) failed: code %d", e.Step, e.Code)
+	msg := fmt.Sprintf("xiaomidrive: login (%s) failed: code %d", e.Step, e.Code)
 	if e.Description != "" {
 		msg += ": " + e.Description
 	}

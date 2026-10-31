@@ -1,37 +1,37 @@
-# micloud
+# xiaomi-drive-go
 
-小米云盘(`i.mi.com`)的 Go 客户端库与命令行工具。基于 `docs/` 下对接口的实测笔记实现。
+非官方的小米云盘(`i.mi.com`)Go 客户端库和命令行工具,另有 OpenList 驱动,可以把云盘挂载成本地文件夹。
 
-接口设计对齐 [OpenList](https://github.com/OpenListTeam/OpenList) 驱动(`List` / `Link` / `MakeDir` / `Move` / `Rename` / `Copy` / `Remove` / `Put` / `GetRoot`),便于先接入 OpenList;后续若挂载体验不足,再据此实现 rclone backend 或 FUSE 层。
+An unofficial Go client library and CLI for Xiaomi Cloud Drive (小米云盘, `i.mi.com`), plus an OpenList driver for mounting the drive as a local folder.
 
-## 结构
+> **免责声明**:本项目与小米公司无关。所用接口来自对网页版的分析,不是公开 API,小米随时可能修改或限制。请只用于自己的账号,风险自负。
+>
+> **Disclaimer**: Not affiliated with Xiaomi. The API is reverse-engineered from the web client and may change or break at any time. Use with your own account at your own risk.
 
-```
-micloud/                核心库(package micloud)
-├── session.go          会话:凭据、持久化、令牌续期、passToken 静默恢复、401 自动重试
-├── login.go            登录:Cookie 导入、二维码、短信验证码、sts 换令牌
-├── crypto.go           短信登录的 AES-128-CBC + RSA-PKCS1v1.5 加密(与网页端字节一致)
-├── transport.go        底层 HTTP、&&&START&&& 前缀处理、Set-Cookie 解析
-├── files.go            列目录(自动翻页)、按路径查找、详情、新建目录、重命名、搜索、容量
-├── filemanager.go      移动/复制/删除(异步任务轮询,检查 failedRecords)
-├── download.go         直链与 Range 下载
-├── upload.go           分块上传(并发、秒传短路)、覆盖写(改名+删旧)
-├── trash.go            回收站列表/恢复/永久删除
-├── name.go             名称校验与非法字符映射
-├── qr.go               终端二维码渲染
-├── types.go errors.go jsonx.go
-├── driver/             OpenList 风格驱动适配(仅依赖核心库,演示映射关系)
-└── cmd/micloud/        命令行工具
-```
+## 功能
 
-## 命令行
+- **登录**:扫码登录(推荐)、短信验证码登录、Cookie 导入。不支持账号密码登录。
+- **长期免登录**:保存 `passToken`(约 30 天,每次使用后顺延),`serviceToken` 过期时自动换新,后台每 5 分钟续期。
+- **文件操作**:列目录、按路径查找、搜索、容量、Range 下载、4 MiB 分块并发上传(含秒传)、新建目录、重命名、移动、复制、删除、回收站。
+- **服务端行为的处理**:名称规则本地校验;异步任务即使返回成功也检查 `failedRecords`;移动、复制、重命名冲突时返回明确错误。
+
+## 安装 CLI
+
+从 [Releases](https://github.com/Guyuepp/xiaomi-drive-go/releases) 下载对应平台的压缩包,或者用 Go 安装:
 
 ```
-go build -o micloud ./cmd/micloud
+go install github.com/Guyuepp/xiaomi-drive-go/cmd/micloud@latest
+```
 
-micloud login qr                 # 扫码登录(推荐,最稳)
-micloud login sms <手机号>        # 短信验证码登录
+macOS 上第一次运行可能被系统拦下(程序没有经过 Apple 公证),可以执行 `xattr -d com.apple.quarantine micloud`。
+
+## 命令行用法
+
+```
+micloud login qr                 # 扫码登录(推荐)
+micloud login sms <手机号>        # 短信验证码登录(大陆号码直接写 11 位)
 micloud login cookie --user <id> --service <token> [--pass <passToken>]
+micloud export                   # 打印 user_id 和 pass_token,用于配置 OpenList
 
 micloud whoami                   # 容量
 micloud ls [路径]
@@ -41,106 +41,85 @@ micloud put <本地文件> <远程目录> [--name 名称]
 micloud mv|cp <源> <目标目录>
 micloud rename <路径> <新名称>
 micloud rm <路径>                 # 移入回收站
-micloud link <路径>               # 24 小时直链
+micloud link <路径>               # 直链,约 24 小时有效
 micloud search <关键词>
 micloud trash ls|restore <id>|purge <id>
 ```
 
-凭据保存在 `os.UserConfigDir()/micloud/credentials.json`(权限 0600)。
+扫码用「小米账号」App(设置 → 小米账号 → 扫码登录)或米家 App。凭据保存在 `os.UserConfigDir()/micloud/credentials.json`,权限 0600。
 
 ## 作为库使用
 
+```
+go get github.com/Guyuepp/xiaomi-drive-go
+```
+
 ```go
-store := &micloud.FileStore{Path: credPath}
-c := micloud.NewClient(micloud.WithStore(store))
+import "github.com/Guyuepp/xiaomi-drive-go"
+
+store := &xiaomidrive.FileStore{Path: credPath}
+c := xiaomidrive.NewClient(xiaomidrive.WithStore(store))
 
 if !c.LoggedIn() {
     ch, _ := c.StartQRLogin(ctx)
-    art, _ := micloud.RenderQR(ch.Payload)
-    fmt.Print(art)            // 终端里展示二维码
-    _ = c.PollQR(ctx, ch)     // 阻塞到手机确认
+    art, _ := xiaomidrive.RenderQR(ch.Payload)
+    fmt.Print(art)         // 在终端显示二维码
+    _ = c.PollQR(ctx, ch)  // 阻塞到手机上确认
 }
-c.StartKeepAlive(ctx)         // 后台每 5 分钟续期 serviceToken
+c.StartKeepAlive(ctx)      // 后台续期 serviceToken
 
-files, _ := c.List(ctx, micloud.Root())
+files, _ := c.List(ctx, xiaomidrive.Root())
 ```
 
-## 接入 OpenList
+v0 阶段接口可能变化。
 
-驱动在 OpenList 的 fork 里(`openlist/` 目录,`micloud` 分支,`drivers/micloud/`),通过 `go.mod` 里的 `replace github.com/Guyuepp/micloud => ../` 引用本库。
+## 挂载到本地(OpenList)
 
-```
-cd openlist
-# 首次需要前端页面(与官方 build.sh 相同的来源)
-gh release download v4.2.9 -R OpenListTeam/OpenList-Frontend -p 'openlist-frontend-dist-v4.2.9.tar.gz'
-tar -xzf openlist-frontend-dist-v4.2.9.tar.gz -C public/dist
-go build -o openlist .
-```
+OpenList 驱动在 [OpenList 的 fork](https://github.com/Guyuepp/OpenList) 里,那里提供包含驱动的完整 OpenList 下载。添加存储时选择驱动 `MiCloud`,`user_id` 和 `pass_token` 用 `micloud login qr` 登录后执行 `micloud export` 获得。
 
-添加存储:驱动选 `MiCloud`,`user_id` 和 `pass_token` 用 `micloud login qr` 登录后执行 `micloud export` 获得。根目录 ID 默认 `0`。
+驱动的处理方式:
+- 续期得到的 `serviceToken` 自动写回 OpenList 的数据库。
+- 服务端不接受 0 字节文件,驱动把空文件作为本地占位保存并照常显示,写入内容后再上传。
+- 移动到已有同名项的目录时直接报错,不让服务端自动改名为 `name(1)`。
 
-- 续期得到的 `serviceToken` 自动写回 OpenList 数据库;重启后先用 `pass_token` 换新令牌。
-- 覆盖上传由 OpenList 先把旧文件改名为 `*.openlist_to_delete`,上传成功后删除(`NoOverwriteUpload`)。
-- 移动到已有同名项的目录时直接报错,而不是让服务端自动改名为 `name(1)`。
-- OpenList 默认隐藏容量(`hide_storage_details`),需要在设置里关闭才会显示。
-- 通过 WebDAV 覆盖文件时,OpenList 会额外做一份服务端备份再删除,所以每次覆盖会往回收站里多放一两个文件。
+Linux 上用 systemd 和 rclone 部署的完整示例见 [docs/deploy-linux.md](docs/deploy-linux.md)。
 
-`driver/` 目录是早期的无依赖示意版本,真实驱动以 fork 里的为准。
+## 已知限制
 
-## 本机部署
-
-| 项目 | 位置 |
-| --- | --- |
-| OpenList 程序 | `~/.local/bin/openlist`,由 `scripts/build-openlist.sh` 编译安装 |
-| 数据目录 | `~/.local/share/openlist`(`config.json`、`data.db`;管理员初始密码在 `admin_password`,权限 600) |
-| 服务 | `~/.config/systemd/user/openlist.service`,只监听 `127.0.0.1:5244` |
-| 存储 | 挂载路径 `/micloud`;WebDAV 地址 `http://127.0.0.1:5244/dav/micloud/` |
-| CLI | `~/.local/bin/micloud`,凭据 `~/.config/micloud/credentials.json` |
-
-```
-systemctl --user status openlist        # 状态
-journalctl --user -u openlist -f        # 日志
-scripts/build-openlist.sh && systemctl --user restart openlist   # 改了库或驱动后更新
-```
-
-用户服务只在登录期间运行。需要开机即运行(不登录也运行)时执行 `sudo loginctl enable-linger $USER`。
-
-### 挂载到 `~/MiCloud`
-
-rclone 通过 OpenList 的 WebDAV 挂载,服务文件是 `~/.config/systemd/user/rclone-micloud.service`(仓库里 `deploy/systemd/` 有副本)。
-
-- rclone 使用单独的 OpenList 用户 `rclone`:只能访问 `/micloud`,只有上传、新建目录、重命名、移动、复制、删除和 WebDAV 权限。它的密码只存在 `~/.config/rclone/rclone.conf`(权限 600,rclone 的 obscure 只是混淆,不是加密)。
-- 开启了 `--vfs-cache-mode full`:写入先进本地缓存 `~/.cache/rclone`,关闭文件后后台上传;缓存上限 10G,保留 24 小时。
-- **空文件**:服务端不接受 0 字节文件。OpenList 驱动把空文件记在存储配置里(本地占位),列目录时照常显示,写入内容后才真正上传。在 OpenList 网页里编辑这个存储并保存时,这些记录是否保留取决于前端如何提交配置,**没有验证过**。
-
-```
-systemctl --user status rclone-micloud
-journalctl --user -u rclone-micloud -f
-systemctl --user restart rclone-micloud     # 重新挂载
-```
+- 服务端没有原地覆盖写接口。`Overwrite` 用"上传到临时名 → 删除旧文件 → 改名"模拟,**文件 ID 会变**,旧文件进回收站。
+- 名称不区分大小写;`rename` 和 `mkdir` 之后列表约有 0.2–0.6 秒延迟。
+- 回收站没有"清空"接口,只能逐个永久删除。
+- 更多未验证的行为见 [docs/api-summary.md](docs/api-summary.md) 第 9 节。
 
 ## 安全
 
-- `passToken`(约 30 天、滚动续期)权限远高于 `serviceToken`(约 15 分钟)。只用 0600 文件或系统钥匙串保存,任何日志都不得出现。
-- 密码登录**不支持**(涉及风控、二次验证、图形验证码)。
+- `passToken` 等同于长期登录凭据,比 `serviceToken` 敏感得多。不要发给别人,也不要贴到 issue、截图或日志里。
+- 提交 issue 前请检查日志,去掉其中的令牌、用户 ID 和手机号。
+- 不需要时,可以在小米账号的「登录设备管理」里移除对应的登录设备。
 
-## 已知限制(详见 `docs/`)
+## 接口文档
 
-- 不能上传空文件(服务端拒绝 0 字节)。库返回 `ErrEmptyFile`;OpenList 驱动用本地占位兼容。
-- 没有原地覆盖写接口;`Overwrite` 用“上传临时名 → 删旧 → 改名”模拟,**文件 ID 会变**。
-- 名称大小写不敏感;`rename`/`mkdir` 后列表有 0.2–0.6 秒延迟。
-- 任务型操作(移动/复制/删除)即使 `SUCCESS` 也可能在 `failedRecords` 里有同名冲突,库已检查并返回 `TaskError`。
+- [docs/api-summary.md](docs/api-summary.md):接口总览,按实现需要组织。
+- [docs/api-notes.md](docs/api-notes.md):详细笔记,每条标注"已验证 / 源码 / 未知"。
+- [docs/probe-scripts/](docs/probe-scripts/):调研时用的 Python 探测脚本,作为登录流程的参考。
 
-## 测试
+## 开发
 
 ```
 go test ./...
 ```
 
-覆盖:AES 加密与 openssl 字节一致、`eui` 结构、名称校验(字符数/字节数/非法字符)、灵活 JSON 解码(大整数 ID 不丢精度)、记录转换与路径拼接。
-
-真实账号的端到端测试(需要已登录的凭据文件;只在 `/__micloud_probe__` 下新建临时目录,结束后删除,并只永久删除自己创建的文件):
+真实账号的端到端测试默认不运行。它只在 `/__micloud_probe__` 下新建临时目录,结束后删除,并且只永久删除自己创建的文件:
 
 ```
 MICLOUD_CREDENTIALS=~/.config/micloud/credentials.json go test -tags e2e -run E2E -v .
 ```
+
+## 相关项目
+
+- [wangbjun/go-micloud](https://github.com/wangbjun/go-micloud):较早的交互式命令行客户端,使用账号密码登录,包含相册下载。
+- [champlus/xiaomi-cloud-drive](https://github.com/champlus/xiaomi-cloud-drive)(米盘):macOS 客户端,在 Finder 中挂载小米云盘。
+
+## 许可证
+
+[MIT](LICENSE)。OpenList fork 沿用 OpenList 的 AGPL-3.0。

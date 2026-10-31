@@ -1,4 +1,4 @@
-package micloud
+package xiaomidrive
 
 import (
 	"context"
@@ -56,10 +56,10 @@ func fetchLoginURL(ctx context.Context, cli *http.Client) (string, error) {
 		} `json:"data"`
 	}
 	if jerr := json.Unmarshal(stripStart(body), &r); jerr != nil {
-		return "", fmt.Errorf("micloud: login bootstrap decode: %w", jerr)
+		return "", fmt.Errorf("xiaomidrive: login bootstrap decode: %w", jerr)
 	}
 	if r.Data.LoginURL == "" {
-		return "", fmt.Errorf("micloud: login bootstrap: empty loginUrl")
+		return "", fmt.Errorf("xiaomidrive: login bootstrap: empty loginUrl")
 	}
 	return r.Data.LoginURL, nil
 }
@@ -76,10 +76,10 @@ func bootstrap(ctx context.Context, cli *http.Client) (bootParams, error) {
 	}
 	var p bootParams
 	if jerr := json.Unmarshal(stripStart(body), &p); jerr != nil {
-		return bootParams{}, fmt.Errorf("micloud: bootstrap decode: %w", jerr)
+		return bootParams{}, fmt.Errorf("xiaomidrive: bootstrap decode: %w", jerr)
 	}
 	if p.Sid == "" || p.Callback == "" {
-		return bootParams{}, fmt.Errorf("micloud: bootstrap: missing parameters")
+		return bootParams{}, fmt.Errorf("xiaomidrive: bootstrap: missing parameters")
 	}
 	return p, nil
 }
@@ -212,7 +212,7 @@ func (c *Client) StartQRLogin(ctx context.Context) (*QRChallenge, error) {
 		Desc     string `json:"desc"`
 	}
 	if jerr := json.Unmarshal(stripStart(body), &r); jerr != nil {
-		return nil, fmt.Errorf("micloud: qr start decode: %w", jerr)
+		return nil, fmt.Errorf("xiaomidrive: qr start decode: %w", jerr)
 	}
 	if r.Code != 0 || r.LoginURL == "" || r.LP == "" {
 		return nil, &LoginError{Step: "qr-start", Code: r.Code, Description: r.Desc}
@@ -245,7 +245,7 @@ func (c *Client) PollQR(ctx context.Context, ch *QRChallenge) error {
 		Desc            string     `json:"desc"`
 	}
 	if jerr := json.Unmarshal(stripStart(body), &r); jerr != nil {
-		return fmt.Errorf("micloud: qr poll decode: %w", jerr)
+		return fmt.Errorf("xiaomidrive: qr poll decode: %w", jerr)
 	}
 	if r.Code == CodeQRExpired {
 		return ErrQRExpired
@@ -303,7 +303,7 @@ func (c *Client) SendSMSCode(ctx context.Context, phone string) (*SMSChallenge, 
 		} `json:"data"`
 	}
 	if jerr := json.Unmarshal(stripStart(body), &r); jerr != nil {
-		return nil, fmt.Errorf("micloud: sms send decode: %w", jerr)
+		return nil, fmt.Errorf("xiaomidrive: sms send decode: %w", jerr)
 	}
 	if r.CaptchaURL != "" {
 		return nil, &LoginError{Step: "sms-send", Code: r.Code, Description: r.Desc, CaptchaURL: r.CaptchaURL}
@@ -334,7 +334,7 @@ func (c *Client) SMSLogin(ctx context.Context, ch *SMSChallenge, code string) er
 		Desc string `json:"desc"`
 	}
 	if jerr := json.Unmarshal(stripStart(body), &pre); jerr != nil {
-		return fmt.Errorf("micloud: phoneInfo decode: %w", jerr)
+		return fmt.Errorf("xiaomidrive: phoneInfo decode: %w", jerr)
 	}
 	if pre.Code != 0 || pre.Data.Status != 2 {
 		return &LoginError{Step: "sms-verify", Code: pre.Code, Description: pre.Desc}
@@ -360,7 +360,7 @@ func (c *Client) SMSLogin(ctx context.Context, ch *SMSChallenge, code string) er
 		Desc            string     `json:"desc"`
 	}
 	if jerr := json.Unmarshal(stripStart(body), &r); jerr != nil {
-		return fmt.Errorf("micloud: sms login decode: %w", jerr)
+		return fmt.Errorf("xiaomidrive: sms login decode: %w", jerr)
 	}
 	if r.Code != 0 || r.SecurityStatus != 0 || r.Location == "" {
 		return &LoginError{Step: "sms-login", Code: r.Code, Description: r.Desc, NotificationURL: r.NotificationURL}

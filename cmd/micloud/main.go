@@ -1,5 +1,5 @@
 // Command micloud is a terminal client for Xiaomi Cloud Drive (i.mi.com),
-// built on the github.com/Guyuepp/micloud core library.
+// built on the github.com/Guyuepp/xiaomi-drive-go library.
 package main
 
 import (
@@ -15,7 +15,7 @@ import (
 	"strings"
 	"syscall"
 
-	"github.com/Guyuepp/micloud"
+	"github.com/Guyuepp/xiaomi-drive-go"
 )
 
 func main() {
@@ -117,13 +117,13 @@ func credPath() string {
 	return filepath.Join(dir, "micloud", "credentials.json")
 }
 
-func newClient() *micloud.Client {
-	return micloud.NewClient(micloud.WithStore(&micloud.FileStore{Path: credPath()}))
+func newClient() *xiaomidrive.Client {
+	return xiaomidrive.NewClient(xiaomidrive.WithStore(&xiaomidrive.FileStore{Path: credPath()}))
 }
 
 // authedClient returns a logged-in client or an error telling the user to log
 // in.
-func authedClient() (*micloud.Client, error) {
+func authedClient() (*xiaomidrive.Client, error) {
 	c := newClient()
 	if !c.LoggedIn() {
 		return nil, errors.New("未登录,请先运行 `micloud login qr`")
@@ -155,12 +155,12 @@ func cmdLogin(ctx context.Context, args []string) error {
 	}
 }
 
-func loginQR(ctx context.Context, c *micloud.Client) error {
+func loginQR(ctx context.Context, c *xiaomidrive.Client) error {
 	ch, err := c.StartQRLogin(ctx)
 	if err != nil {
 		return err
 	}
-	art, err := micloud.RenderQR(ch.Payload)
+	art, err := xiaomidrive.RenderQR(ch.Payload)
 	if err != nil {
 		return err
 	}
@@ -168,7 +168,7 @@ func loginQR(ctx context.Context, c *micloud.Client) error {
 	fmt.Print(art)
 	fmt.Printf("\n请用「小米账号」App 或米家 App 扫描上面的二维码并确认登录(%d 秒内有效)。\n等待确认中…\n", ch.Timeout)
 	if err := c.PollQR(ctx, ch); err != nil {
-		if errors.Is(err, micloud.ErrQRExpired) {
+		if errors.Is(err, xiaomidrive.ErrQRExpired) {
 			return errors.New("二维码已过期,请重试")
 		}
 		return err
@@ -177,7 +177,7 @@ func loginQR(ctx context.Context, c *micloud.Client) error {
 	return nil
 }
 
-func loginSMS(ctx context.Context, c *micloud.Client, phone string) error {
+func loginSMS(ctx context.Context, c *xiaomidrive.Client, phone string) error {
 	ch, err := c.SendSMSCode(ctx, phone)
 	if err != nil {
 		return err
@@ -195,8 +195,8 @@ func loginSMS(ctx context.Context, c *micloud.Client, phone string) error {
 	return nil
 }
 
-func loginCookie(ctx context.Context, c *micloud.Client, args []string) error {
-	var creds micloud.Credentials
+func loginCookie(ctx context.Context, c *xiaomidrive.Client, args []string) error {
+	var creds xiaomidrive.Credentials
 	for i := 0; i < len(args); i++ {
 		switch args[i] {
 		case "--user":
@@ -288,7 +288,7 @@ func cmdLs(ctx context.Context, args []string) error {
 	return nil
 }
 
-func printFile(f *micloud.File) {
+func printFile(f *xiaomidrive.File) {
 	kind := "-"
 	size := humanBytes(f.GetSize())
 	if f.IsDir() {
@@ -311,7 +311,7 @@ func cmdLink(ctx context.Context, args []string) error {
 		return err
 	}
 	if f.IsDir() {
-		return micloud.ErrIsDir
+		return xiaomidrive.ErrIsDir
 	}
 	l, err := c.Link(ctx, f.GetID())
 	if err != nil {
@@ -329,7 +329,7 @@ func cmdSearch(ctx context.Context, args []string) error {
 	if len(args) < 1 {
 		return errors.New("用法: micloud search <关键词>")
 	}
-	files, err := c.Search(ctx, args[0], micloud.SearchOptions{})
+	files, err := c.Search(ctx, args[0], xiaomidrive.SearchOptions{})
 	if err != nil {
 		return err
 	}
@@ -383,7 +383,7 @@ func cmdRm(ctx context.Context, args []string) error {
 	if f.IsRoot() {
 		return errors.New("不能删除根目录")
 	}
-	if err := c.Remove(ctx, []*micloud.File{f}); err != nil {
+	if err := c.Remove(ctx, []*xiaomidrive.File{f}); err != nil {
 		return err
 	}
 	fmt.Printf("已删除 %s(移入回收站)\n", args[0])
@@ -407,9 +407,9 @@ func cmdMv(ctx context.Context, args []string) error {
 		return err
 	}
 	if !dst.IsDir() {
-		return micloud.ErrNotDir
+		return xiaomidrive.ErrNotDir
 	}
-	if err := c.Move(ctx, []*micloud.File{src}, dst.GetID()); err != nil {
+	if err := c.Move(ctx, []*xiaomidrive.File{src}, dst.GetID()); err != nil {
 		return err
 	}
 	fmt.Printf("已移动 %s -> %s\n", args[0], args[1])
@@ -433,9 +433,9 @@ func cmdCp(ctx context.Context, args []string) error {
 		return err
 	}
 	if !dst.IsDir() {
-		return micloud.ErrNotDir
+		return xiaomidrive.ErrNotDir
 	}
-	if err := c.Copy(ctx, []*micloud.File{src}, dst.GetID()); err != nil {
+	if err := c.Copy(ctx, []*xiaomidrive.File{src}, dst.GetID()); err != nil {
 		return err
 	}
 	fmt.Printf("已复制 %s -> %s\n", args[0], args[1])
@@ -486,7 +486,7 @@ func cmdGet(ctx context.Context, args []string) error {
 		return err
 	}
 	if f.IsDir() {
-		return micloud.ErrIsDir
+		return xiaomidrive.ErrIsDir
 	}
 	if out == "" {
 		out = f.GetName()
@@ -543,7 +543,7 @@ func cmdPut(ctx context.Context, args []string) error {
 		return err
 	}
 	if !dir.IsDir() {
-		return micloud.ErrNotDir
+		return xiaomidrive.ErrNotDir
 	}
 	if name == "" {
 		name = filepath.Base(local)
@@ -555,7 +555,7 @@ func cmdPut(ctx context.Context, args []string) error {
 	defer src.Close()
 
 	size := fi.Size()
-	opts := micloud.UploadOptions{ModTime: fi.ModTime()}
+	opts := xiaomidrive.UploadOptions{ModTime: fi.ModTime()}
 	printed := false
 	if size > 0 {
 		last := -1
@@ -573,7 +573,7 @@ func cmdPut(ctx context.Context, args []string) error {
 		fmt.Fprintln(os.Stderr)
 	}
 	if err != nil {
-		if errors.Is(err, micloud.ErrEmptyFile) {
+		if errors.Is(err, xiaomidrive.ErrEmptyFile) {
 			return errors.New("小米云盘不接受空文件")
 		}
 		return err

@@ -1,4 +1,4 @@
-package micloud
+package xiaomidrive
 
 import (
 	"encoding/base64"

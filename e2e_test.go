@@ -7,7 +7,7 @@
 //
 // All writes happen inside a fresh folder under /__micloud_probe__, which is
 // removed afterwards. Only items this test created are purged from the bin.
-package micloud_test
+package xiaomidrive_test
 
 import (
 	"bytes"
@@ -20,19 +20,18 @@ import (
 	"testing"
 	"time"
 
-	"github.com/Guyuepp/micloud"
-	"github.com/Guyuepp/micloud/driver"
+	"github.com/Guyuepp/xiaomi-drive-go"
 )
 
 const probeRoot = "__micloud_probe__"
 
-func e2eClient(t *testing.T) *micloud.Client {
+func e2eClient(t *testing.T) *xiaomidrive.Client {
 	t.Helper()
 	p := os.Getenv("MICLOUD_CREDENTIALS")
 	if p == "" {
 		t.Skip("MICLOUD_CREDENTIALS not set")
 	}
-	c := micloud.NewClient(micloud.WithStore(&micloud.FileStore{Path: p}))
+	c := xiaomidrive.NewClient(xiaomidrive.WithStore(&xiaomidrive.FileStore{Path: p}))
 	if !c.LoggedIn() {
 		t.Skip("no credentials at MICLOUD_CREDENTIALS")
 	}
@@ -44,7 +43,7 @@ func TestE2E(t *testing.T) {
 	defer cancel()
 	c := e2eClient(t)
 
-	probe, err := c.MakeDir(ctx, micloud.RootID, probeRoot)
+	probe, err := c.MakeDir(ctx, xiaomidrive.RootID, probeRoot)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -55,12 +54,12 @@ func TestE2E(t *testing.T) {
 	var created []string // file IDs to purge from the bin afterwards
 	t.Cleanup(func() {
 		cctx := context.Background()
-		if err := c.Remove(cctx, []*micloud.File{dir}); err != nil {
+		if err := c.Remove(cctx, []*xiaomidrive.File{dir}); err != nil {
 			t.Errorf("cleanup remove: %v", err)
 			return
 		}
 		for _, id := range created {
-			if err := c.Purge(cctx, id); err != nil && !errors.Is(err, micloud.ErrNotFound) {
+			if err := c.Purge(cctx, id); err != nil && !errors.Is(err, xiaomidrive.ErrNotFound) {
 				t.Errorf("cleanup purge %s: %v", id, err)
 			}
 		}
@@ -70,7 +69,7 @@ func TestE2E(t *testing.T) {
 	content := make([]byte, 5<<20+3)
 	rand.Read(content)
 
-	f, err := c.Upload(ctx, dir.ID, "data.bin", bytes.NewReader(content), micloud.UploadOptions{})
+	f, err := c.Upload(ctx, dir.ID, "data.bin", bytes.NewReader(content), xiaomidrive.UploadOptions{})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -103,7 +102,7 @@ func TestE2E(t *testing.T) {
 
 	t.Run("Overwrite", func(t *testing.T) {
 		next := []byte("replacement content\n")
-		nf, err := c.Overwrite(ctx, dir.ID, "data.bin", bytes.NewReader(next), micloud.UploadOptions{})
+		nf, err := c.Overwrite(ctx, dir.ID, "data.bin", bytes.NewReader(next), xiaomidrive.UploadOptions{})
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -147,27 +146,26 @@ func TestE2E(t *testing.T) {
 		}
 	})
 
-	t.Run("Driver", func(t *testing.T) {
-		d := driver.New(c)
-		objs, err := d.List(ctx, dir)
+	t.Run("LinkAndCopy", func(t *testing.T) {
+		objs, err := c.List(ctx, dir)
 		if err != nil {
 			t.Fatal(err)
 		}
 		if len(objs) != 1 {
-			t.Fatalf("driver list: %d objs", len(objs))
+			t.Fatalf("list: %d objs", len(objs))
 		}
-		l, err := d.Link(ctx, objs[0])
-		if err != nil || l.URL == "" || l.Expiration == nil || *l.Expiration <= 0 {
-			t.Fatalf("driver link: %+v %v", l, err)
+		l, err := c.Link(ctx, objs[0].ID)
+		if err != nil || l.URL == "" || !l.Expires.After(time.Now()) {
+			t.Fatalf("link: %+v %v", l, err)
 		}
-		sub, err := d.MakeDir(ctx, dir, "sub")
+		sub, err := c.MakeDir(ctx, dir.ID, "sub")
 		if err != nil {
 			t.Fatal(err)
 		}
-		if _, err := d.Copy(ctx, objs[0], sub); err != nil {
+		if err := c.Copy(ctx, objs[:1], sub.ID); err != nil {
 			t.Fatal(err)
 		}
-		kids, err := c.List(ctx, sub.(*micloud.File))
+		kids, err := c.List(ctx, sub)
 		if err != nil || len(kids) != 1 {
 			t.Fatalf("copy result: %d kids, %v", len(kids), err)
 		}
@@ -175,13 +173,13 @@ func TestE2E(t *testing.T) {
 	})
 
 	t.Run("Errors", func(t *testing.T) {
-		if _, err := c.Get(ctx, "1"); !errors.Is(err, micloud.ErrNotFound) {
+		if _, err := c.Get(ctx, "1"); !errors.Is(err, xiaomidrive.ErrNotFound) {
 			t.Errorf("Get bogus id: %v, want ErrNotFound", err)
 		}
-		if _, err := c.Upload(ctx, dir.ID, "empty", bytes.NewReader(nil), micloud.UploadOptions{}); !errors.Is(err, micloud.ErrEmptyFile) {
+		if _, err := c.Upload(ctx, dir.ID, "empty", bytes.NewReader(nil), xiaomidrive.UploadOptions{}); !errors.Is(err, xiaomidrive.ErrEmptyFile) {
 			t.Errorf("empty upload: %v, want ErrEmptyFile", err)
 		}
-		if err := c.Move(ctx, []*micloud.File{dir}, dir.ID); !errors.Is(err, micloud.ErrIntoSelf) {
+		if err := c.Move(ctx, []*xiaomidrive.File{dir}, dir.ID); !errors.Is(err, xiaomidrive.ErrIntoSelf) {
 			t.Errorf("move into self: %v, want ErrIntoSelf", err)
 		}
 	})

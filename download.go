@@ -1,4 +1,4 @@
-package micloud
+package xiaomidrive
 
 import (
 	"context"
@@ -27,7 +27,7 @@ func (c *Client) detail(ctx context.Context, id string) (*File, storageInfo, err
 	}
 	var d fileWithStorage
 	if err := json.Unmarshal(raw, &d); err != nil {
-		return nil, storageInfo{}, fmt.Errorf("micloud: detail decode: %w", err)
+		return nil, storageInfo{}, fmt.Errorf("xiaomidrive: detail decode: %w", err)
 	}
 	if d.ID == "" {
 		d.ID = flexString(id)
@@ -77,7 +77,7 @@ func (c *Client) Download(ctx context.Context, id string, offset, length int64) 
 	}
 	if resp.StatusCode != http.StatusOK && resp.StatusCode != http.StatusPartialContent {
 		resp.Body.Close()
-		return nil, fmt.Errorf("micloud: download %s: HTTP %d", id, resp.StatusCode)
+		return nil, fmt.Errorf("xiaomidrive: download %s: HTTP %d", id, resp.StatusCode)
 	}
 	return resp.Body, nil
 }

@@ -1,4 +1,4 @@
-package micloud
+package xiaomidrive
 
 import (
 	"bytes"
@@ -104,7 +104,7 @@ func hashBlocks(r io.Reader, w io.Writer) (size int64, sum string, blocks []bloc
 
 // spoolContent buffers a stream to a temp file while hashing it.
 func spoolContent(r io.Reader) (*spooled, error) {
-	tmp, err := os.CreateTemp("", "micloud-upload-*")
+	tmp, err := os.CreateTemp("", "xiaomidrive-upload-*")
 	if err != nil {
 		return nil, err
 	}
@@ -127,7 +127,7 @@ func hashReaderAt(ra io.ReaderAt, size int64) (*spooled, error) {
 		return nil, err
 	}
 	if n != size {
-		return nil, fmt.Errorf("micloud: upload: read %d bytes, expected %d", n, size)
+		return nil, fmt.Errorf("xiaomidrive: upload: read %d bytes, expected %d", n, size)
 	}
 	return &spooled{ra: ra, size: size, sha1: sum, blocks: blocks, cleanup: func() {}}, nil
 }
@@ -257,7 +257,7 @@ func (c *Client) uploadSpooled(ctx context.Context, parentID, name string, sp *s
 	}
 	var cr createResp
 	if err := json.Unmarshal(raw, &cr); err != nil {
-		return nil, fmt.Errorf("micloud: upload create decode: %w", err)
+		return nil, fmt.Errorf("xiaomidrive: upload create decode: %w", err)
 	}
 
 	// Rapid upload: the service already has this content and created the file.
@@ -268,13 +268,13 @@ func (c *Client) uploadSpooled(ctx context.Context, parentID, name string, sp *s
 			}
 			return c.Get(ctx, string(cr.ID))
 		}
-		return nil, fmt.Errorf("micloud: upload: rapid upload reported no id")
+		return nil, fmt.Errorf("xiaomidrive: upload: rapid upload reported no id")
 	}
 	if len(cr.KSS.NodeURLs) == 0 || cr.UploadID == "" {
-		return nil, fmt.Errorf("micloud: upload: incomplete create response")
+		return nil, fmt.Errorf("xiaomidrive: upload: incomplete create response")
 	}
 	if n := len(cr.KSS.BlockMetas); n != len(sp.blocks) {
-		return nil, fmt.Errorf("micloud: upload: server expected %d blocks, have %d", n, len(sp.blocks))
+		return nil, fmt.Errorf("xiaomidrive: upload: server expected %d blocks, have %d", n, len(sp.blocks))
 	}
 
 	commitMetas, err := c.uploadBlocks(ctx, sp, &cr, opts)
@@ -303,7 +303,7 @@ func (c *Client) uploadSpooled(ctx context.Context, parentID, name string, sp *s
 		ID flexString `json:"id"`
 	}
 	if err := json.Unmarshal(raw, &commit); err != nil {
-		return nil, fmt.Errorf("micloud: upload commit decode: %w", err)
+		return nil, fmt.Errorf("xiaomidrive: upload commit decode: %w", err)
 	}
 	return c.Get(ctx, string(commit.ID))
 }
@@ -363,7 +363,7 @@ func (c *Client) uploadBlocks(ctx context.Context, sp *spooled, cr *createResp, 
 	}
 	for i, m := range commitMetas {
 		if m == "" {
-			return nil, fmt.Errorf("micloud: upload: block %d produced no commit meta", i)
+			return nil, fmt.Errorf("xiaomidrive: upload: block %d produced no commit meta", i)
 		}
 	}
 	return commitMetas, nil
@@ -374,7 +374,7 @@ func (c *Client) uploadBlocks(ctx context.Context, sp *spooled, cr *createResp, 
 type errBlockRejected struct{ stat string }
 
 func (e *errBlockRejected) Error() string {
-	return fmt.Sprintf("micloud: block upload: stat=%q", e.stat)
+	return fmt.Sprintf("xiaomidrive: block upload: stat=%q", e.stat)
 }
 
 func (c *Client) uploadOneBlock(ctx context.Context, node, fileMeta, blockMeta string, sp *spooled, b blockSpool, wrap func(context.Context, io.Reader) io.Reader) (string, error) {
@@ -425,7 +425,7 @@ func (c *Client) postBlock(ctx context.Context, node, fileMeta, blockMeta string
 	respBody, _ := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
 	var br blockResp
 	if err := json.Unmarshal(respBody, &br); err != nil {
-		return "", fmt.Errorf("micloud: block upload decode (HTTP %d): %w", resp.StatusCode, err)
+		return "", fmt.Errorf("xiaomidrive: block upload decode (HTTP %d): %w", resp.StatusCode, err)
 	}
 	if br.Stat != "BLOCK_COMPLETED" || br.CommitMeta == "" {
 		return "", &errBlockRejected{stat: br.Stat}
@@ -459,11 +459,11 @@ func (c *Client) Overwrite(ctx context.Context, parentID, name string, r io.Read
 	}
 	if old != nil {
 		if err := c.Remove(ctx, []*File{old}); err != nil {
-			return nil, fmt.Errorf("micloud: overwrite: remove old: %w", err)
+			return nil, fmt.Errorf("xiaomidrive: overwrite: remove old: %w", err)
 		}
 	}
 	if err := c.Rename(ctx, uploaded.ID, name); err != nil {
-		return nil, fmt.Errorf("micloud: overwrite: rename: %w", err)
+		return nil, fmt.Errorf("xiaomidrive: overwrite: rename: %w", err)
 	}
 	uploaded.Name = name
 	return uploaded, nil
