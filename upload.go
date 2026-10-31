@@ -7,6 +7,7 @@ import (
 	"crypto/sha1"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"mime"
@@ -32,8 +33,12 @@ type UploadOptions struct {
 	// ModTime / CreateTime set the client-side timestamps (default: now).
 	ModTime    time.Time
 	CreateTime time.Time
-	// Progress, if set, is called with bytes uploaded so far.
+	// Progress, if set, is called with bytes uploaded so far. It may be called
+	// from several goroutines, but never concurrently.
 	Progress func(uploaded int64)
+	// WrapBody, if set, wraps each block's request body before it is sent,
+	// e.g. for rate limiting. It is called again for every retry.
+	WrapBody func(ctx context.Context, r io.Reader) io.Reader
 }
 
 func (o UploadOptions) concurrency() int {
@@ -43,6 +48,9 @@ func (o UploadOptions) concurrency() int {
 	return o.Concurrency
 }
 
+// maxBlockAttempts bounds retries of a block upload on transport errors.
+const maxBlockAttempts = 3
+
 type blockSpool struct {
 	sha1   string
 	md5    string
@@ -50,15 +58,51 @@ type blockSpool struct {
 	offset int64
 }
 
-// spooled is content buffered to a temp file with precomputed hashes.
+// spooled is random-access content with precomputed hashes.
 type spooled struct {
-	f       *os.File
+	ra      io.ReaderAt
 	size    int64
 	sha1    string
 	blocks  []blockSpool
 	cleanup func()
 }
 
+// hashBlocks reads r to EOF, computing the whole-file SHA-1 and per-block
+// SHA-1/MD5. Each chunk is also written to w when w is non-nil.
+func hashBlocks(r io.Reader, w io.Writer) (size int64, sum string, blocks []blockSpool, err error) {
+	whole := sha1.New()
+	buf := make([]byte, blockSize)
+	for {
+		n, rerr := io.ReadFull(r, buf)
+		if n > 0 {
+			chunk := buf[:n]
+			if w != nil {
+				if _, werr := w.Write(chunk); werr != nil {
+					return 0, "", nil, werr
+				}
+			}
+			whole.Write(chunk)
+			bs := sha1.Sum(chunk)
+			bm := md5.Sum(chunk)
+			blocks = append(blocks, blockSpool{
+				sha1:   hex.EncodeToString(bs[:]),
+				md5:    hex.EncodeToString(bm[:]),
+				size:   int64(n),
+				offset: size,
+			})
+			size += int64(n)
+		}
+		if rerr == io.EOF || rerr == io.ErrUnexpectedEOF {
+			break
+		}
+		if rerr != nil {
+			return 0, "", nil, rerr
+		}
+	}
+	return size, hex.EncodeToString(whole.Sum(nil)), blocks, nil
+}
+
+// spoolContent buffers a stream to a temp file while hashing it.
 func spoolContent(r io.Reader) (*spooled, error) {
 	tmp, err := os.CreateTemp("", "micloud-upload-*")
 	if err != nil {
@@ -68,44 +112,24 @@ func spoolContent(r io.Reader) (*spooled, error) {
 		tmp.Close()
 		os.Remove(tmp.Name())
 	}
-	whole := sha1.New()
-	var blocks []blockSpool
-	var total int64
-	buf := make([]byte, blockSize)
-	for {
-		n, rerr := io.ReadFull(r, buf)
-		if n > 0 {
-			chunk := buf[:n]
-			if _, werr := tmp.Write(chunk); werr != nil {
-				cleanup()
-				return nil, werr
-			}
-			whole.Write(chunk)
-			bs := sha1.Sum(chunk)
-			bm := md5.Sum(chunk)
-			blocks = append(blocks, blockSpool{
-				sha1:   hex.EncodeToString(bs[:]),
-				md5:    hex.EncodeToString(bm[:]),
-				size:   int64(n),
-				offset: total,
-			})
-			total += int64(n)
-		}
-		if rerr == io.EOF || rerr == io.ErrUnexpectedEOF {
-			break
-		}
-		if rerr != nil {
-			cleanup()
-			return nil, rerr
-		}
+	size, sum, blocks, err := hashBlocks(r, tmp)
+	if err != nil {
+		cleanup()
+		return nil, err
 	}
-	return &spooled{
-		f:       tmp,
-		size:    total,
-		sha1:    hex.EncodeToString(whole.Sum(nil)),
-		blocks:  blocks,
-		cleanup: cleanup,
-	}, nil
+	return &spooled{ra: tmp, size: size, sha1: sum, blocks: blocks, cleanup: cleanup}, nil
+}
+
+// hashReaderAt hashes random-access content in place, without copying it.
+func hashReaderAt(ra io.ReaderAt, size int64) (*spooled, error) {
+	n, sum, blocks, err := hashBlocks(io.NewSectionReader(ra, 0, size), nil)
+	if err != nil {
+		return nil, err
+	}
+	if n != size {
+		return nil, fmt.Errorf("micloud: upload: read %d bytes, expected %d", n, size)
+	}
+	return &spooled{ra: ra, size: size, sha1: sum, blocks: blocks, cleanup: func() {}}, nil
 }
 
 func detectMime(name, override string) string {
@@ -177,6 +201,27 @@ func (c *Client) Upload(ctx context.Context, parentID, name string, r io.Reader,
 		return nil, err
 	}
 	defer sp.cleanup()
+	return c.uploadSpooled(ctx, parentID, name, sp, opts)
+}
+
+// UploadReaderAt is Upload for random-access content of a known size (a file
+// or an already cached stream). The content is read twice, once to hash and
+// once to send, but never copied to a temp file.
+func (c *Client) UploadReaderAt(ctx context.Context, parentID, name string, ra io.ReaderAt, size int64, opts UploadOptions) (*File, error) {
+	if err := ValidateName(name); err != nil {
+		return nil, err
+	}
+	if size <= 0 {
+		return nil, ErrEmptyFile
+	}
+	sp, err := hashReaderAt(ra, size)
+	if err != nil {
+		return nil, err
+	}
+	return c.uploadSpooled(ctx, parentID, name, sp, opts)
+}
+
+func (c *Client) uploadSpooled(ctx context.Context, parentID, name string, sp *spooled, opts UploadOptions) (*File, error) {
 	if sp.size == 0 {
 		return nil, ErrEmptyFile
 	}
@@ -218,6 +263,9 @@ func (c *Client) Upload(ctx context.Context, parentID, name string, r io.Reader,
 	// Rapid upload: the service already has this content and created the file.
 	if bool(cr.Exists) {
 		if cr.ID != "" {
+			if opts.Progress != nil {
+				opts.Progress(sp.size)
+			}
 			return c.Get(ctx, string(cr.ID))
 		}
 		return nil, fmt.Errorf("micloud: upload: rapid upload reported no id")
@@ -292,7 +340,7 @@ func (c *Client) uploadBlocks(ctx context.Context, sp *spooled, cr *createResp, 
 			}
 			defer func() { <-sem }()
 
-			cm, err := c.uploadOneBlock(ctx, node, cr.KSS.FileMeta, blockMeta, sp, sp.blocks[i])
+			cm, err := c.uploadOneBlock(ctx, node, cr.KSS.FileMeta, blockMeta, sp, sp.blocks[i], opts.WrapBody)
 			mu.Lock()
 			defer mu.Unlock()
 			if err != nil {
@@ -321,18 +369,52 @@ func (c *Client) uploadBlocks(ctx context.Context, sp *spooled, cr *createResp, 
 	return commitMetas, nil
 }
 
-func (c *Client) uploadOneBlock(ctx context.Context, node, fileMeta, blockMeta string, sp *spooled, b blockSpool) (string, error) {
+// errBlockRejected marks a block failure the KSS node reported via "stat";
+// those are deterministic and not retried.
+type errBlockRejected struct{ stat string }
+
+func (e *errBlockRejected) Error() string {
+	return fmt.Sprintf("micloud: block upload: stat=%q", e.stat)
+}
+
+func (c *Client) uploadOneBlock(ctx context.Context, node, fileMeta, blockMeta string, sp *spooled, b blockSpool, wrap func(context.Context, io.Reader) io.Reader) (string, error) {
 	data := make([]byte, b.size)
-	if _, err := sp.f.ReadAt(data, b.offset); err != nil && err != io.EOF {
+	if _, err := sp.ra.ReadAt(data, b.offset); err != nil && err != io.EOF {
 		return "", err
 	}
+	var lastErr error
+	for attempt := 0; attempt < maxBlockAttempts; attempt++ {
+		if attempt > 0 {
+			if err := sleepCtx(ctx, time.Duration(attempt)*time.Second); err != nil {
+				return "", err
+			}
+		}
+		cm, err := c.postBlock(ctx, node, fileMeta, blockMeta, data, wrap)
+		if err == nil {
+			return cm, nil
+		}
+		var rej *errBlockRejected
+		if errors.As(err, &rej) || ctx.Err() != nil {
+			return "", err
+		}
+		lastErr = err
+	}
+	return "", lastErr
+}
+
+func (c *Client) postBlock(ctx context.Context, node, fileMeta, blockMeta string, data []byte, wrap func(context.Context, io.Reader) io.Reader) (string, error) {
 	// The web client sends "chunk_pos=0&&file_meta=..." verbatim (two
 	// ampersands); the metas are URL-safe tokens, sent unescaped.
 	rawURL := fmt.Sprintf("%s/upload_block_chunk?chunk_pos=0&&file_meta=%s&block_meta=%s", node, fileMeta, blockMeta)
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, rawURL, bytes.NewReader(data))
+	var body io.Reader = bytes.NewReader(data)
+	if wrap != nil {
+		body = wrap(ctx, body)
+	}
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, rawURL, body)
 	if err != nil {
 		return "", err
 	}
+	req.ContentLength = int64(len(data))
 	req.Header.Set("User-Agent", defaultUserAgent)
 	req.Header.Set("Content-Type", "application/octet-stream")
 	resp, err := c.s.http.Do(req)
@@ -340,13 +422,13 @@ func (c *Client) uploadOneBlock(ctx context.Context, node, fileMeta, blockMeta s
 		return "", err
 	}
 	defer resp.Body.Close()
-	body, _ := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
+	respBody, _ := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
 	var br blockResp
-	if err := json.Unmarshal(body, &br); err != nil {
+	if err := json.Unmarshal(respBody, &br); err != nil {
 		return "", fmt.Errorf("micloud: block upload decode (HTTP %d): %w", resp.StatusCode, err)
 	}
 	if br.Stat != "BLOCK_COMPLETED" || br.CommitMeta == "" {
-		return "", fmt.Errorf("micloud: block upload: stat=%q", br.Stat)
+		return "", &errBlockRejected{stat: br.Stat}
 	}
 	return br.CommitMeta, nil
 }

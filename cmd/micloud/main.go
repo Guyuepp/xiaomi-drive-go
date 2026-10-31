@@ -35,6 +35,8 @@ func main() {
 		err = cmdLogin(ctx, args)
 	case "logout":
 		err = cmdLogout()
+	case "export":
+		err = cmdExport()
 	case "whoami", "quota":
 		err = cmdQuota(ctx)
 	case "ls":
@@ -84,6 +86,7 @@ func usage() {
   micloud login cookie --user <id> --service <token> [--pass <passToken>]
                                           用 Cookie 登录(serviceToken 短期,passToken 长期)
   micloud logout                          删除本地保存的凭据
+  micloud export                          打印 userId 和 passToken,用于填写 OpenList 存储配置
 
   micloud whoami                          显示容量使用
   micloud ls [路径]                        列目录(默认根目录)
@@ -213,6 +216,16 @@ func loginCookie(ctx context.Context, c *micloud.Client, args []string) error {
 		return err
 	}
 	fmt.Println("登录成功。")
+	return nil
+}
+
+func cmdExport() error {
+	creds := newClient().Session().Credentials()
+	if creds.UserID == "" || creds.PassToken == "" {
+		return errors.New("没有可导出的 passToken,请先运行 `micloud login qr` 或 `micloud login sms`")
+	}
+	fmt.Fprintln(os.Stderr, "注意:passToken 等同于长期登录凭据,不要发给别人,也不要贴到聊天、截图或日志里。")
+	fmt.Printf("user_id:    %s\npass_token: %s\n", creds.UserID, creds.PassToken)
 	return nil
 }
 
@@ -555,7 +568,7 @@ func cmdPut(ctx context.Context, args []string) error {
 			}
 		}
 	}
-	f, err := c.Upload(ctx, dir.GetID(), name, src, opts)
+	f, err := c.UploadReaderAt(ctx, dir.GetID(), name, src, size, opts)
 	if printed {
 		fmt.Fprintln(os.Stderr)
 	}

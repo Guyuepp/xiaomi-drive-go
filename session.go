@@ -110,8 +110,13 @@ type Session struct {
 
 	logf func(string, ...any)
 
-	kaOnce sync.Once
-	kaStop chan struct{}
+	// refreshMu serialises passToken restores so concurrent 401s trigger a
+	// single exchange.
+	refreshMu sync.Mutex
+
+	kaOnce   sync.Once
+	stopOnce sync.Once
+	kaStop   chan struct{}
 }
 
 // Option configures a Session / Client.
@@ -190,16 +195,16 @@ func (s *Session) updateServiceToken(token, userID string) {
 	}
 }
 
-func (s *Session) cookieHeader() string {
-	s.mu.RLock()
-	defer s.mu.RUnlock()
-	return fmt.Sprintf("serviceToken=%s; userId=%s", s.creds.ServiceToken, s.creds.UserID)
-}
-
 func (s *Session) serviceToken() string {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 	return s.creds.ServiceToken
+}
+
+func (s *Session) userID() string {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return s.creds.UserID
 }
 
 // get issues an authenticated GET and returns the decoded data payload.
@@ -207,14 +212,17 @@ func (s *Session) get(ctx context.Context, path string, query url.Values) (json.
 	return s.call(ctx, http.MethodGet, path, query, nil)
 }
 
-// postForm issues an authenticated POST, injecting the serviceToken form field.
+// postForm issues an authenticated POST. The serviceToken form field the
+// service requires is added per attempt.
 func (s *Session) postForm(ctx context.Context, path string, form url.Values) (json.RawMessage, error) {
 	if form == nil {
 		form = url.Values{}
 	}
-	form.Set("serviceToken", s.serviceToken())
 	return s.call(ctx, http.MethodPost, path, nil, form)
 }
+
+// maxGetAttempts bounds retries of idempotent GETs on transport errors.
+const maxGetAttempts = 3
 
 // call performs an authenticated request and recovers once from a 401 by
 // restoring the session from passToken.
@@ -223,18 +231,15 @@ func (s *Session) call(ctx context.Context, method, path string, query, form url
 		return nil, ErrUnauthorized
 	}
 	for attempt := 0; attempt < 2; attempt++ {
-		env, status, err := s.callOnce(ctx, method, path, query, form)
+		token := s.serviceToken()
+		env, status, err := s.callWithRetry(ctx, method, path, query, form, token)
 		if err != nil {
 			return nil, err
 		}
 		if env.unauthorized(status) {
 			if attempt == 0 {
-				if rerr := s.Refresh(ctx); rerr != nil {
+				if rerr := s.refreshIfStale(ctx, token); rerr != nil {
 					return nil, rerr
-				}
-				// The POST form carries the old serviceToken; refresh it.
-				if form != nil {
-					form.Set("serviceToken", s.serviceToken())
 				}
 				continue
 			}
@@ -254,20 +259,61 @@ func (s *Session) call(ctx context.Context, method, path string, query, form url
 	return nil, ErrUnauthorized
 }
 
-func (s *Session) callOnce(ctx context.Context, method, path string, query, form url.Values) (*apiEnvelope, int, error) {
+// callWithRetry retries GETs on transport errors with a short backoff. POSTs
+// are never retried: they are not idempotent (e.g. filemanager tasks).
+func (s *Session) callWithRetry(ctx context.Context, method, path string, query, form url.Values, token string) (*apiEnvelope, int, error) {
+	attempts := 1
+	if method == http.MethodGet {
+		attempts = maxGetAttempts
+	}
+	var lastErr error
+	for i := 0; i < attempts; i++ {
+		if i > 0 {
+			if err := sleepCtx(ctx, time.Duration(i)*500*time.Millisecond); err != nil {
+				return nil, 0, err
+			}
+		}
+		env, status, err := s.callOnce(ctx, method, path, query, form, token)
+		if err == nil {
+			return env, status, nil
+		}
+		if ctx.Err() != nil {
+			return nil, 0, ctx.Err()
+		}
+		lastErr = err
+	}
+	return nil, 0, lastErr
+}
+
+func sleepCtx(ctx context.Context, d time.Duration) error {
+	t := time.NewTimer(d)
+	defer t.Stop()
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-t.C:
+		return nil
+	}
+}
+
+func (s *Session) callOnce(ctx context.Context, method, path string, query, form url.Values, token string) (*apiEnvelope, int, error) {
 	rawURL := hostDrive + path
 	if len(query) > 0 {
 		rawURL += "?" + query.Encode()
 	}
-	var headers map[string]string
 	var resp *http.Response
 	var body []byte
 	var err error
-	cookie := s.cookieHeader()
+	cookie := fmt.Sprintf("serviceToken=%s; userId=%s", token, s.userID())
 	if method == http.MethodPost {
-		resp, body, err = httpPostForm(ctx, s.http, rawURL, form, map[string]string{"Cookie": cookie})
+		f := url.Values{}
+		for k, v := range form {
+			f[k] = v
+		}
+		f.Set("serviceToken", token)
+		resp, body, err = httpPostForm(ctx, s.http, rawURL, f, map[string]string{"Cookie": cookie})
 	} else {
-		resp, body, err = httpGetBody(ctx, s.http, rawURL, cookie, headers)
+		resp, body, err = httpGetBody(ctx, s.http, rawURL, cookie, nil)
 	}
 	if err != nil {
 		return nil, 0, err
@@ -285,9 +331,26 @@ func (s *Session) callOnce(ctx context.Context, method, path string, query, form
 	return &env, resp.StatusCode, nil
 }
 
+// refreshIfStale restores the session unless another goroutine already
+// replaced the token that just failed.
+func (s *Session) refreshIfStale(ctx context.Context, failedToken string) error {
+	s.refreshMu.Lock()
+	defer s.refreshMu.Unlock()
+	if s.serviceToken() != failedToken {
+		return nil
+	}
+	return s.refreshLocked(ctx)
+}
+
 // Refresh exchanges the passToken for a new serviceToken (api-notes §2.7). It
 // is called automatically on 401 but may also be invoked directly.
 func (s *Session) Refresh(ctx context.Context) error {
+	s.refreshMu.Lock()
+	defer s.refreshMu.Unlock()
+	return s.refreshLocked(ctx)
+}
+
+func (s *Session) refreshLocked(ctx context.Context) error {
 	creds := s.Credentials()
 	if !creds.canRestore() {
 		return ErrUnauthorized
@@ -300,7 +363,7 @@ func (s *Session) Refresh(ctx context.Context) error {
 	if creds.DeviceID != "" {
 		cookie += "; deviceId=" + creds.DeviceID + "; pass_ua=web"
 	}
-	resp, body, err := httpGetBody(ctx, s.noRedir, loginURL+"&_json=true", cookie, nil)
+	_, body, err := httpGetBody(ctx, s.noRedir, loginURL+"&_json=true", cookie, nil)
 	if err != nil {
 		return err
 	}
@@ -318,7 +381,6 @@ func (s *Session) Refresh(ctx context.Context) error {
 	if r.Code != 0 || r.SecurityStatus != 0 || r.Location == "" {
 		return &LoginError{Step: "restore", Code: r.Code, Description: r.Desc}
 	}
-	_ = resp
 	token, userID, err := exchangeServiceToken(ctx, s.noRedir, r.Location, cookie)
 	if err != nil {
 		return err
@@ -356,13 +418,9 @@ func (s *Session) StartKeepAlive(ctx context.Context) {
 	})
 }
 
-// Stop halts the keep-alive goroutine.
+// Stop halts the keep-alive goroutine. It is safe to call more than once.
 func (s *Session) Stop() {
-	select {
-	case <-s.kaStop:
-	default:
-		close(s.kaStop)
-	}
+	s.stopOnce.Do(func() { close(s.kaStop) })
 }
 
 // renew hits a status endpoint; the new serviceToken arrives via Set-Cookie and
