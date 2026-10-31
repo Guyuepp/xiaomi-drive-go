@@ -13,6 +13,7 @@ An unofficial Go client library and CLI for Xiaomi Cloud Drive (小米云盘, `i
 - **登录**:扫码登录(推荐)、短信验证码登录、Cookie 导入。不支持账号密码登录。
 - **长期免登录**:保存 `passToken`(约 30 天,每次使用后顺延),`serviceToken` 过期时自动换新,后台每 5 分钟续期。
 - **文件操作**:列目录、按路径查找、搜索、容量、Range 下载、4 MiB 分块并发上传(含秒传)、新建目录、重命名、移动、复制、删除、回收站。
+- **云相册**:列相册、按日期和相册列照片、下载照片和视频(支持 Range)、上传到相册并指定拍摄日期、整库备份、相册的新建/改名/删除、照片的移动/复制/删除、相册回收站。
 - **服务端行为的处理**:名称规则本地校验;异步任务即使返回成功也检查 `failedRecords`;移动、复制、重命名冲突时返回明确错误。
 
 ## 安装 CLI
@@ -44,9 +45,28 @@ micloud rm <路径>                 # 移入回收站
 micloud link <路径>               # 直链,约 24 小时有效
 micloud search <关键词>
 micloud trash ls|restore <id>|purge <id>
+
+micloud gallery albums           # 云相册:列相册
+micloud gallery ls [相册] [--from YYYY-MM-DD] [--to YYYY-MM-DD] [--video]
+micloud gallery get <照片ID> [-o 输出]
+micloud gallery put <本地文件> <相册> [--date "YYYY-MM-DD HH:MM:SS"]
+micloud gallery backup <目录> [--album 相册] [--skip-private] [-j 并发]
+micloud gallery mkalbum|rename-album|rmalbum ...
+micloud gallery mv|cp <照片ID> <相册>
+micloud gallery rm <照片ID>
+micloud gallery trash ls|restore <id>|purge <id>
 ```
 
 扫码用「小米账号」App(设置 → 小米账号 → 扫码登录)或米家 App。凭据保存在 `os.UserConfigDir()/micloud/credentials.json`,权限 0600。
+
+云相册说明:
+- `<相册>` 写相册名或 ID。相机是 `1`,截屏是 `2`,私密是 `1000`。
+- `backup` 默认备份总览加私密相册,这就是全部照片和视频(私密相册不在总览里)。文件按相册分子目录保存,下载后核对 SHA-1,修改时间设为拍摄日期。本地已有同名且大小相同的文件会跳过,中断后重跑即可。
+- 服务端不读取文件里的 EXIF 拍摄日期。`put` 默认按文件修改时间归档,用 `--date` 可以指定拍摄时间。
+- 同一相册里上传同名但内容不同的文件时,服务端会把新文件改名为 `名称_<毫秒时间戳>.扩展名`。
+- 移动照片后照片 ID 会变。
+- 短时间内请求太多时,小米会暂时拒绝这个账号的相册请求(`user is blocked`),等几分钟就会恢复。`backup` 遇到这种情况会停下来。
+- 开启了相册端到端加密的账号目前不支持。
 
 ## 作为库使用
 
@@ -101,6 +121,7 @@ Linux 上用 systemd 和 rclone 部署的完整示例见 [docs/deploy-linux.md](
 
 - [docs/api-summary.md](docs/api-summary.md):接口总览,按实现需要组织。
 - [docs/api-notes.md](docs/api-notes.md):详细笔记,每条标注"已验证 / 源码 / 未知"。
+- [docs/gallery-notes.md](docs/gallery-notes.md):云相册接口笔记。
 - [docs/probe-scripts/](docs/probe-scripts/):调研时用的 Python 探测脚本,作为登录流程的参考。
 
 ## 开发
