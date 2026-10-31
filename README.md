@@ -87,6 +87,24 @@ go build -o openlist .
 
 `driver/` 目录是早期的无依赖示意版本,真实驱动以 fork 里的为准。
 
+## 本机部署
+
+| 项目 | 位置 |
+| --- | --- |
+| OpenList 程序 | `~/.local/bin/openlist`,由 `scripts/build-openlist.sh` 编译安装 |
+| 数据目录 | `~/.local/share/openlist`(`config.json`、`data.db`;管理员初始密码在 `admin_password`,权限 600) |
+| 服务 | `~/.config/systemd/user/openlist.service`,只监听 `127.0.0.1:5244` |
+| 存储 | 挂载路径 `/micloud`;WebDAV 地址 `http://127.0.0.1:5244/dav/micloud/` |
+| CLI | `~/.local/bin/micloud`,凭据 `~/.config/micloud/credentials.json` |
+
+```
+systemctl --user status openlist        # 状态
+journalctl --user -u openlist -f        # 日志
+scripts/build-openlist.sh && systemctl --user restart openlist   # 改了库或驱动后更新
+```
+
+用户服务只在登录期间运行。需要开机即运行(不登录也运行)时执行 `sudo loginctl enable-linger $USER`。
+
 ## 安全
 
 - `passToken`(约 30 天、滚动续期)权限远高于 `serviceToken`(约 15 分钟)。只用 0600 文件或系统钥匙串保存,任何日志都不得出现。
