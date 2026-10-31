@@ -1,0 +1,374 @@
+package micloud
+
+import (
+	"context"
+	"encoding/json"
+	"fmt"
+	"net/http"
+	"net/url"
+	"os"
+	"path/filepath"
+	"sync"
+	"time"
+)
+
+// Credentials are everything needed to authenticate and to silently restore a
+// session. PassToken is long-lived (~30 days, rolling) and far more sensitive
+// than ServiceToken (~15 min); persist it only with 0600 permissions and never
+// log it.
+type Credentials struct {
+	UserID            string `json:"userId"`
+	PassToken         string `json:"passToken,omitempty"`
+	ServiceToken      string `json:"serviceToken,omitempty"`
+	DeviceID          string `json:"deviceId,omitempty"`
+	DeviceFingerprint string `json:"deviceFingerprint,omitempty"`
+	// CUserID is informational; the service does not require it.
+	CUserID string `json:"cUserId,omitempty"`
+}
+
+func (c Credentials) canAuthenticate() bool {
+	return c.UserID != "" && (c.ServiceToken != "" || c.PassToken != "")
+}
+
+func (c Credentials) canRestore() bool {
+	return c.UserID != "" && c.PassToken != ""
+}
+
+// Store persists credentials between runs.
+type Store interface {
+	Load() (*Credentials, error)
+	Save(*Credentials) error
+}
+
+// FileStore keeps credentials in a 0600 JSON file.
+type FileStore struct {
+	Path string
+}
+
+// Load reads the file. A missing file yields empty credentials and no error.
+func (s *FileStore) Load() (*Credentials, error) {
+	b, err := os.ReadFile(s.Path)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return &Credentials{}, nil
+		}
+		return nil, err
+	}
+	var c Credentials
+	if err := json.Unmarshal(b, &c); err != nil {
+		return nil, err
+	}
+	return &c, nil
+}
+
+// Save writes the file atomically with 0600 permissions.
+func (s *FileStore) Save(c *Credentials) error {
+	if err := os.MkdirAll(filepath.Dir(s.Path), 0o700); err != nil {
+		return err
+	}
+	b, err := json.MarshalIndent(c, "", "  ")
+	if err != nil {
+		return err
+	}
+	tmp := s.Path + ".tmp"
+	if err := os.WriteFile(tmp, b, 0o600); err != nil {
+		return err
+	}
+	return os.Rename(tmp, s.Path)
+}
+
+// memStore is an in-memory Store, the default when none is supplied.
+type memStore struct {
+	mu sync.Mutex
+	c  Credentials
+}
+
+func (m *memStore) Load() (*Credentials, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	c := m.c
+	return &c, nil
+}
+
+func (m *memStore) Save(c *Credentials) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.c = *c
+	return nil
+}
+
+// Session owns the credentials and the HTTP machinery. It is safe for
+// concurrent use. Business calls recover from an expired serviceToken
+// automatically by restoring from passToken.
+type Session struct {
+	mu    sync.RWMutex
+	creds Credentials
+
+	store   Store
+	http    *http.Client // follows redirects (downloads, storage hosts)
+	noRedir *http.Client // stops at first redirect (sts exchange)
+
+	logf func(string, ...any)
+
+	kaOnce sync.Once
+	kaStop chan struct{}
+}
+
+// Option configures a Session / Client.
+type Option func(*Session)
+
+// WithStore sets the credential store.
+func WithStore(s Store) Option { return func(se *Session) { se.store = s } }
+
+// WithHTTPTimeout sets the timeout of the general-purpose client. The default
+// (0) means no timeout, which suits large downloads; per-call deadlines come
+// from the context.
+func WithHTTPTimeout(d time.Duration) Option {
+	return func(se *Session) { se.http = newHTTPClient(true, d) }
+}
+
+// WithLogger installs a printf-style logger. It must never be passed secrets;
+// the library only logs endpoints and non-sensitive status.
+func WithLogger(f func(string, ...any)) Option {
+	return func(se *Session) { se.logf = f }
+}
+
+func newSession(opts ...Option) *Session {
+	s := &Session{
+		store:   &memStore{},
+		http:    newHTTPClient(true, 0),
+		noRedir: newHTTPClient(false, 60*time.Second),
+		logf:    func(string, ...any) {},
+		kaStop:  make(chan struct{}),
+	}
+	for _, o := range opts {
+		o(s)
+	}
+	if c, err := s.store.Load(); err == nil && c != nil {
+		s.creds = *c
+	}
+	return s
+}
+
+// Credentials returns a copy of the current credentials.
+func (s *Session) Credentials() Credentials {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return s.creds
+}
+
+// LoggedIn reports whether the session has enough to authenticate.
+func (s *Session) LoggedIn() bool {
+	return s.Credentials().canAuthenticate()
+}
+
+// setCredentials replaces the credentials and persists them.
+func (s *Session) setCredentials(c Credentials) {
+	s.mu.Lock()
+	s.creds = c
+	snapshot := s.creds
+	s.mu.Unlock()
+	if err := s.store.Save(&snapshot); err != nil {
+		s.logf("micloud: save credentials: %v", err)
+	}
+}
+
+// updateServiceToken records a freshly issued serviceToken (and userId) and
+// persists it.
+func (s *Session) updateServiceToken(token, userID string) {
+	s.mu.Lock()
+	if token != "" {
+		s.creds.ServiceToken = token
+	}
+	if userID != "" {
+		s.creds.UserID = userID
+	}
+	snapshot := s.creds
+	s.mu.Unlock()
+	if err := s.store.Save(&snapshot); err != nil {
+		s.logf("micloud: save credentials: %v", err)
+	}
+}
+
+func (s *Session) cookieHeader() string {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return fmt.Sprintf("serviceToken=%s; userId=%s", s.creds.ServiceToken, s.creds.UserID)
+}
+
+func (s *Session) serviceToken() string {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return s.creds.ServiceToken
+}
+
+// get issues an authenticated GET and returns the decoded data payload.
+func (s *Session) get(ctx context.Context, path string, query url.Values) (json.RawMessage, error) {
+	return s.call(ctx, http.MethodGet, path, query, nil)
+}
+
+// postForm issues an authenticated POST, injecting the serviceToken form field.
+func (s *Session) postForm(ctx context.Context, path string, form url.Values) (json.RawMessage, error) {
+	if form == nil {
+		form = url.Values{}
+	}
+	form.Set("serviceToken", s.serviceToken())
+	return s.call(ctx, http.MethodPost, path, nil, form)
+}
+
+// call performs an authenticated request and recovers once from a 401 by
+// restoring the session from passToken.
+func (s *Session) call(ctx context.Context, method, path string, query, form url.Values) (json.RawMessage, error) {
+	if !s.LoggedIn() {
+		return nil, ErrUnauthorized
+	}
+	for attempt := 0; attempt < 2; attempt++ {
+		env, status, err := s.callOnce(ctx, method, path, query, form)
+		if err != nil {
+			return nil, err
+		}
+		if env.unauthorized(status) {
+			if attempt == 0 {
+				if rerr := s.Refresh(ctx); rerr != nil {
+					return nil, rerr
+				}
+				// The POST form carries the old serviceToken; refresh it.
+				if form != nil {
+					form.Set("serviceToken", s.serviceToken())
+				}
+				continue
+			}
+			return nil, &APIError{Endpoint: path, HTTPStatus: http.StatusUnauthorized}
+		}
+		if env.Code != 0 {
+			return env.Data, &APIError{
+				Endpoint:    path,
+				HTTPStatus:  status,
+				Code:        env.Code,
+				Reason:      env.Reason,
+				Description: env.Description,
+			}
+		}
+		return env.Data, nil
+	}
+	return nil, ErrUnauthorized
+}
+
+func (s *Session) callOnce(ctx context.Context, method, path string, query, form url.Values) (*apiEnvelope, int, error) {
+	rawURL := hostDrive + path
+	if len(query) > 0 {
+		rawURL += "?" + query.Encode()
+	}
+	var headers map[string]string
+	var resp *http.Response
+	var body []byte
+	var err error
+	cookie := s.cookieHeader()
+	if method == http.MethodPost {
+		resp, body, err = httpPostForm(ctx, s.http, rawURL, form, map[string]string{"Cookie": cookie})
+	} else {
+		resp, body, err = httpGetBody(ctx, s.http, rawURL, cookie, headers)
+	}
+	if err != nil {
+		return nil, 0, err
+	}
+	// Status endpoints re-issue the serviceToken via Set-Cookie.
+	if tok := setCookieValue(resp, "serviceToken"); tok != "" {
+		s.updateServiceToken(tok, setCookieValue(resp, "userId"))
+	}
+	var env apiEnvelope
+	if len(body) > 0 {
+		if jerr := json.Unmarshal(stripStart(body), &env); jerr != nil && resp.StatusCode == http.StatusOK {
+			return nil, resp.StatusCode, fmt.Errorf("micloud: %s: decode response: %w", path, jerr)
+		}
+	}
+	return &env, resp.StatusCode, nil
+}
+
+// Refresh exchanges the passToken for a new serviceToken (api-notes §2.7). It
+// is called automatically on 401 but may also be invoked directly.
+func (s *Session) Refresh(ctx context.Context) error {
+	creds := s.Credentials()
+	if !creds.canRestore() {
+		return ErrUnauthorized
+	}
+	loginURL, err := fetchLoginURL(ctx, s.noRedir)
+	if err != nil {
+		return err
+	}
+	cookie := fmt.Sprintf("passToken=%s; userId=%s", creds.PassToken, creds.UserID)
+	if creds.DeviceID != "" {
+		cookie += "; deviceId=" + creds.DeviceID + "; pass_ua=web"
+	}
+	resp, body, err := httpGetBody(ctx, s.noRedir, loginURL+"&_json=true", cookie, nil)
+	if err != nil {
+		return err
+	}
+	var r struct {
+		Code           int    `json:"code"`
+		SecurityStatus int    `json:"securityStatus"`
+		Location       string `json:"location"`
+		Desc           string `json:"desc"`
+	}
+	if jerr := json.Unmarshal(stripStart(body), &r); jerr != nil {
+		return fmt.Errorf("micloud: restore: decode: %w", jerr)
+	}
+	// Success requires code==0 AND securityStatus==0; a failure response also
+	// carries a location (to the login page), so location alone is not enough.
+	if r.Code != 0 || r.SecurityStatus != 0 || r.Location == "" {
+		return &LoginError{Step: "restore", Code: r.Code, Description: r.Desc}
+	}
+	_ = resp
+	token, userID, err := exchangeServiceToken(ctx, s.noRedir, r.Location, cookie)
+	if err != nil {
+		return err
+	}
+	if token == "" {
+		return &LoginError{Step: "restore", Code: r.Code, Description: "no serviceToken issued"}
+	}
+	if userID == "" {
+		userID = creds.UserID
+	}
+	s.updateServiceToken(token, userID)
+	return nil
+}
+
+// StartKeepAlive launches a goroutine that renews the serviceToken every 5
+// minutes (api-notes §3). It is a no-op if already started. Stop it with Stop.
+func (s *Session) StartKeepAlive(ctx context.Context) {
+	s.kaOnce.Do(func() {
+		go func() {
+			t := time.NewTicker(5 * time.Minute)
+			defer t.Stop()
+			for {
+				select {
+				case <-ctx.Done():
+					return
+				case <-s.kaStop:
+					return
+				case <-t.C:
+					if err := s.renew(ctx); err != nil {
+						s.logf("micloud: keepalive: %v", err)
+					}
+				}
+			}
+		}()
+	})
+}
+
+// Stop halts the keep-alive goroutine.
+func (s *Session) Stop() {
+	select {
+	case <-s.kaStop:
+	default:
+		close(s.kaStop)
+	}
+}
+
+// renew hits a status endpoint; the new serviceToken arrives via Set-Cookie and
+// is absorbed in callOnce.
+func (s *Session) renew(ctx context.Context) error {
+	q := url.Values{"type": {"AutoRenewal"}, "inactiveTime": {"10"}}
+	_, err := s.get(ctx, "/status/lite/setting", q)
+	return err
+}

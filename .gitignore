@@ -1,0 +1,10 @@
+# OpenList fork is a separate git repository
+/openlist/
+
+# build output
+/micloud
+*.exe
+
+# never commit credentials
+credentials.json
+*.tmp
