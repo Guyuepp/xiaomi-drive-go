@@ -46,7 +46,8 @@
 | 50050 | 照片状态不对 | 对已彻底删除(`purged`)的照片取下载地址(`reason: ... status error`) |
 | 50051 | 不是媒体 | 对不存在的照片 ID(如 `1`)取下载地址(`reason: userId:...,resource:1 is not a media`) |
 | 10008 | 保留相册 | 删除 ID 很小的不存在相册(如 `123`)时 `reason` 是 `Can't delete reserved album`,不是 50012 |
-| 503 | 账号被暂时拦截 | `reason: user is blocked.`,HTTP 仍是 200。见第 9 节 |
+| 503 | 账号被暂时拦截 | `reason: user is blocked.`,`description: 请求超出配额`,HTTP 仍是 200。见第 9 节 |
+| 10008 | 搜索参数不全 | `search` 缺 `clientVersion`(`version is null`)、缺 `language`(`language is null`)、`query` 为空或纯空格(`Query is blank`);`image/list` 的 `accuracyMode` 写错(`invalid accuracy mode`) |
 | 50006、10031 | 移动、复制、删除失败的几种情况 | **[源码]** 网页对这两个码做了静默处理,含义没有触发过 |
 
 KSS 存储节点的错误是 HTTP 200 加 `stat` 字段,见 6.2。
@@ -197,19 +198,151 @@ GET /gallery/user/album/video?ts=<ms>&isShared=false
 - `numOfThumbnails=1` 每个相册返回 1 个缩略图。
 - 系统相册:**[已验证]** 相机(`1`)、截屏(`2`)、私密(`1000`)都出现在 `album/list` 里(33 个相册,`mediaCount` 合计 8996,包含私密相册)。顺序 **[未测]**。
 
-### 4.5 导航与搜索 [已验证,字段结构]
+### 4.5 搜索:整体流程 [已验证]
+
+网页的搜索是四级流程,每一级的输出是下一级的输入。**整条链路可以脱离网页,把上一级返回的 `url`/`dataUrl` 里的参数原样转发即可走通**(已用地点、时间、分类三种类型验证)。
+
+```
+① GET /gallery/user/navigation   搜索框获得焦点时调用,返回推荐入口(人物、地点、分类)
+② GET /gallery/user/search       输入关键词后调用,返回"建议项"列表(不是照片)
+③ GET /gallery/user/result       点击一个建议项后调用,返回 1 到 2 个"数据区块"(dataUrl)
+④ GET /gallery/user/image/list   用 dataUrl 取真正的照片(分页)
+  GET /gallery/user/list         仅"时间"等查询有,取二次细分(facet)
+```
+
+全部是 GET,不需要表单里的 `serviceToken`,只要 Cookie。
+
+**这一组接口的拦截更容易触发**,见第 9 节。测试中约 2 分钟内连发了 20 多个请求(其中连续 8 到 10 个 `search`、`navigation`,几乎没有间隔),之后 `/gallery/user/*` 的读接口全部返回 503 `user is blocked.`,约 4 分钟后恢复。之后把相册读请求的间隔加到 4 到 5 秒,再没有触发。库里要给这些请求加最小间隔,**不要做逐字符联想式搜索**,用户提交时才发一次。
+
+**搜索能搜到什么:**
+
+| 内容 | 能否搜到 |
+| --- | --- |
+| 相册名 | **能**,新建后立刻可搜(同步索引,没有延迟) |
+| 分类(文档、风景、美食 ...)、地点、时间 | 能,由服务端的智能索引提供。新上传的图要几分钟才进入索引(带 GPS 的测试图约 6 分钟内进入了地点索引) |
+| **文件名** | **不能**。用随机文件名搜,返回 `noResult` |
+| **图片里的文字(OCR)** | **不能**。两条独立证据:①上传印有独特字符串的测试图,6 分钟内查不到;②用户在自己账号里用早就同步的手机照片里的文字手动搜索,也没有结果。"文档""身份证"等是**图像分类**(判断图像像不像文档),不是文字识别 |
+
+库里想按文件名或内容找照片,要自己用 `allitems` 或 `galleries` 拉全量后在客户端过滤。`search` 适合做"跟随服务端的分类、地点、时间来浏览"的功能。
+
+### 4.6 导航与搜索接口 [已验证]
+
+**`navigation`**:
 
 ```
 GET /gallery/user/navigation?ts=<ms>&clientVersion=a&language=b
-GET /gallery/user/search?ts=<ms>&clientVersion=a&language=b&query=<词>
--> data: {"expireMs":600000,"sections":[{"title","type","more":{"title","url"},"items":[{"title","count","icon","url","orientation","thumbnailUrl","bigThumbnailUrl"}]}]}
+-> data: {"expireMs":600000,"sections":[{"title","type":"people|location|tag","more":{"title","url"},"items":[{"title","count","icon","url","orientation","thumbnailUrl","bigThumbnailUrl"}]}]}
 ```
 
-- `navigation` 返回人物、地点、分类(`type` 为 `people`、`location`、`tag`)的汇总,是服务端的智能分类。`items[].url` 是 `https://gallery.i.mi.com/result?title=...&type=...` 的 H5 地址,跳转后的数据接口 **[未知]**。网页还有 `/gallery/user/<path>?...` 和 `/gallery/user/...` 形式的动态路径(把 `items[].url` 的路径拼进去再带 `clientVersion`、`language`、`userId`、`pos`、`num`),取分类下照片的方式 **[源码]**,没有调用过。
-- `clientVersion`、`language` 网页固定传 `a`、`b`,不传是否可以 **[未测]**。
-- `search` **不按文件名搜索**:用 `micloud-probe`(测试图的文件名)搜,返回 `sections` 里只有 `noResult` 和 `guide`。有结果时的结构 **[未测]**。库里想按文件名查,要自己用 `allitems` 或 `galleries` 拉全量再过滤。
+返回人物、地点、分类的汇总。`items[].url` 可以直接交给 `result`(4.7)。
 
-### 4.6 缩略图 [已验证]
+**`search`**:
+
+```
+GET /gallery/user/search?ts=<ms>&clientVersion=a&language=b&query=<关键词>
+-> data: {"expireMs":600000,"sections":[{"title","type","items":[{"title","count?","orientation","icon","url","thumbnailUrl","bigThumbnailUrl"}],"otherFixSectionType?"}]}
+```
+
+| 参数 | 说明 |
+| --- | --- |
+| `clientVersion` | **必填**,网页固定传 `a`。不传返回 `10008 version is null`。任何非空值都接受(`z` 也行),没有版本校验 |
+| `language` | **必填**,网页固定传 `b`。不传返回 `10008 language is null`。任何非空值都接受(`zh_CN`、`en_US`、`zh`、`x`),**会改变区块标题的语言**:`en_US` 返回英文标题,其余走中文 |
+| `query` | **必填**。缺失、空串、纯空格都是 `10008 Query is blank` |
+| Cookie | 缺则 HTTP 401 |
+
+**返回的是"建议项",不是照片。** 区块的 `type` 由服务端对关键词做意图识别:
+
+| 关键词举例 | 区块 `title` / `type` | 说明 |
+| --- | --- | --- |
+| 分类词(`文档`、`食物`) | `分类` / `tag_<32位hex>` | 语义查询,`url` 里是序列化的 `query`,**没有 `tagId`**。`食物` 这类同义词会被映射到相近分类 |
+| 同一个词(`文档`) | `分类` / `tag` | 标签库里的近似项(如"手写文档"),`url` 里带 `tag=<名>&tagId=<数字>`。`count` 字段为 0,含义 **[未知]** |
+| 地点词(`深圳`) | `地点` / `location_<hex>` | 标题被规范成全称(如"广东省深圳市") |
+| 年份(`2023`) | `相册+相册` / `album+album_<hex>` 和 `时间` / `time_<hex>` | 同时匹配相册名和时间 |
+| 相册名 | `相册` / `album_<hex>` | 新建的相册立刻可搜 |
+| 无匹配 | `无搜索结果` / `noResult` 加 `搜索攻略` / `guide` | 没有建议项。文件名、图片文字的搜索都落在这里 |
+
+`type` 里的 `<32位hex>` 每次不同,不要依赖,只看前缀(`tag`、`location`、`time`、`album`、`noResult`、`guide`)。`otherFixSectionType` 与 `type` 相同,含义 **[未知]**。
+
+**建议项的 `url`**:
+
+```
+https://gallery.i.mi.com/result?title=<标题>&type=imageList&query=<串>[&supportFeedback=true]
+https://gallery.i.mi.com/result?title=<标题>&type=imageList&tag=<名>&tagId=<数字>&supportFeedback=true
+```
+
+- 这是给手机端 H5 用的地址;**网页版把这个 URL 的整个查询串原样当作 `/gallery/user/result` 的参数**。
+- `query=...` 是 **Java 对象序列化后的 base64url**(解出来有 `java.util.HashSet`、`Integer`、`Enum` 等类名),400 到 900 个字符。它是服务端的不透明查询对象,**不要自己构造**,原样使用 `search`、`navigation` 返回的 `url`。
+- `tag` 加 `tagId`:`tagId` 是服务端的标签编号。已见到的见下表,但不建议硬编码,从 `navigation` 动态取。
+
+| 标签 | `tagId` | 标签 | `tagId` |
+| --- | --- | --- | --- |
+| 银行卡 | 100000 | 植物 | 78 |
+| 身份证 | 100001 | 花 | 242 |
+| 幻灯片 | 100004 | 动漫 | 1496 |
+| 风景 | 200005 | 名片 | 1499 |
+| 文档 | 200007 | 手写文档 | 217 |
+| 美食 | 200001 | | |
+
+### 4.7 result、image/list 与 facet [已验证]
+
+**`result`**(建议项 → 数据区块):
+
+```
+GET /gallery/user/result?ts=<ms>&clientVersion=a&language=b&userId=<userId>&<建议项 url 的全部查询参数>
+-> data: {"sections":[{"title","type":"imageList|facet","dataUrl":"/gallery/user/image/list?...","rankInfos?":[{"tile":"时间","name":"date","style":"N","order":"DESC"}]}]}
+```
+
+| 项目 | 说明 |
+| --- | --- |
+| `userId` | 必填,取自 Cookie 里的 `userId` |
+| 其余参数 | 建议项 `url` 里的 `title`、`type`、`query`(或 `tag`、`tagId`)、`supportFeedback`,原样传 |
+| `imageList` 区块 | 通常有两个:`accuracyMode=high`(标题如"风景",带 `rankInfos`)和 `accuracyMode=low`(标题如"可能是风景的照片",无 `rankInfos`)。网页只展示 `high` |
+| `facet` 区块 | 仅"时间"一类查询有,`dataUrl` 指向 `/gallery/user/list`,见下 |
+| `dataUrl` 里的 `tagId` | 对 `tag`+`tagId` 型建议项是占位值 `999999`,**网页发请求前把它换成真实的 `tagId`**。`query` 型建议项没有这个问题 |
+| `rankInfos` | 排序:`date`,`DESC`,标题"时间"。其他取值 **[未知]** |
+
+**`image/list`**(数据区块 → 照片):
+
+```
+GET /gallery/user/image/list?ts=<ms>&pos=0&num=30&clientVersion=a&language=b&userId=<userId>&type=imageList&accuracyMode=high&(tag=<名>&tagId=<id> | query=<串>)
+-> data: {"nextPos":30,"isLastPage":false,"indexHash":<int>,"galleries":[<照片记录>...]}
+```
+
+照片记录与 `galleries` 完全同构(2.2 节),缩略图、下载走同样的接口。
+
+| 参数 | 行为 |
+| --- | --- |
+| `pos` | 偏移,从 0 开始,不传按 0。超出范围:空结果,`isLastPage:true`,`nextPos` 原样返回你传的值 |
+| `num` | **上限 100**(传 500 实际返回 100)。`0`、负数、不传:默认 **10**。网页用 30 |
+| `accuracyMode` | `high` 或 `low`。**不传默认等同 `high`**。其他值:`10008 invalid accuracy mode` |
+| 翻页 | 把响应里的 `nextPos` 作为下一页的 `pos`,直到 `isLastPage:true` |
+| 排序 | **不是按时间排的** **[已验证]**。"风景"的前 100 张里,按 `dateTaken`、`dateModified`、`createTime` 看,相邻两张顺序反过来的分别有 47、47、49 对(共 99 对)。排序依据 **[未知]**,`rankInfos` 里写的"时间降序"与实际不符。要按日期展示得自己排 |
+
+实测用"风景"分类翻完:`high` 695 张(7 页,每页 100),无重复;`low` 也是同样的 695 张,与 `high` **完全重叠**,所以对这个分类 `low` 不是更宽松的候选集。其他分类 **[未测]**。库里只调 `high` 即可。搜索结果里没有私密相册(`1000`)的照片。
+
+**用 Go 库复测** **[已验证]**(2026-10-31,经 `search`/`navigation` → `result` → `image/list` 整条链路):
+
+| 建议项类型 | 结果 |
+| --- | --- |
+| 分类,`query` 型(`文档`) | 能取到照片 |
+| 分类,`tag`+`tagId` 型(`手写文档`) | 把 `dataUrl` 里的占位 `tagId=999999` 换成建议项的 `tagId` 后能取到照片 |
+| 时间(`2023`) | 能取到,照片的拍摄年份是 2023 |
+| 地点(`navigation` 里的第一项) | 能取到 |
+| 人物(`navigation` 里的第一项,`count` 145) | 翻完正好 145 张,与 `count` 一致 |
+| 相册(`2023` 命中的相册名) | 38 张,全部来自同一个相册 |
+| "风景"翻完 | 695 张,无重复,不含私密相册;9 个请求连续发出(约 9 秒),没有触发拦截 |
+| 下载搜索结果里的照片 | 大小和 SHA-1 与记录一致 |
+
+**`facet`**(二次细分):
+
+```
+GET /gallery/user/list?ts=<ms>&clientVersion=a&language=b&userId=<userId>&type=<>&query=<串>&facet=<>
+-> data: {"nextPos":2,"isLastPage":true,"indexHash":<int>,"items":[{"title","orientation","icon","url","thumbnailUrl","bigThumbnailUrl"}]}
+```
+
+`result` 返回的 `facet` 区块已带好参数,直接用 `dataUrl`。作用:在"2023"这类时间查询的结果里按地点再细分,`items` 是"南昌"之类的分项,每项带自己的 `url`,同样可以继续走 `result` 和 `image/list`。除"时间"以外哪些查询会返回 `facet`、`facet` 参数的取值 **[未测]**。
+
+### 4.8 缩略图 [已验证]
 
 `thumbnailInfo.data`、`bigThumbnailInfo.data`、相册 `thumbnails[].url` 都是:
 
@@ -402,14 +535,27 @@ form: data={"kss":{"file_meta":"<FM>","commit_metas":[{"commit_meta":"<CM>"},...
 
 **时区**:服务端按 UTC+8 分日。`dateModified` 用 UTC 毫秒就行;`exifInfo.dateTime` 要传"东八区的本地钟表时间"。账号设成别的时区时 `exifInfo.dateTime` 是否仍按 UTC+8 **[未测]**。
 
-**`exifInfo` 接受哪些字段**:请求里的 `exifInfo` 是严格的白名单,未知字段会让整个创建请求被拒(10008,`convert json to gallery info failed.`)。
+**`exifInfo` 接受哪些字段**:请求里的 `exifInfo` 是**严格的白名单**,出现不认识的键,整个创建请求被拒(10008,`convert json to gallery info failed.`)。白名单里**每个键有各自固定的拼写,没有统一的大小写规律**(例如 `orientation` 小写开头才对,`FNumber`、`ISOSpeedRatings`、`GPS*` 大写开头才对)。
 
 | 结果 | 字段 |
 | --- | --- |
 | 接受并原样存下 | `dateTime`、`make`、`model`、`imageWidth`、`imageLength`、`orientation`、`flash`、`whiteBalance`、`exposureTime`、`focalLength`(后两个服务端存成字符串,`0.01` → `"0.01"`) |
-| **拒绝**(10008) | `dateTimeOriginal`、`DateTimeOriginal`、`fNumber`、`iso`、`software`、`latitude`、`longitude`、`gpsLatitude`、`gpsLongitude`、`gpsAltitude`、`gpsDateStamp` |
+| 接受(大写拼写) | `FNumber`、`ISOSpeedRatings`、`GPSLatitude`、`GPSLongitude`、`GPSAltitude`、`GPSLatitudeRef`、`GPSLongitudeRef`、`GPSAltitudeRef`、`GPSProcessingMethod`、`GPSTimeStamp`、`GPSDateStamp` |
+| **拒绝**(10008) | `dateTimeOriginal`、`DateTimeOriginal`、`DateTimeDigitized`、`fNumber`、`iso`、`ISO`、`software`、`Software`、`ExposureBiasValue`、`LensModel`、`lensModel`、`latitude`、`longitude`、`gpsLatitude`、`gpsLongitude`、`gpsAltitude`、`gpsDateStamp`,以及大写开头的 `Orientation`、`ExposureTime`、`FocalLength`、`Flash`、`WhiteBalance`、`Make`、`Model`、`ImageWidth`、`ImageLength` |
 
-上面是我试过的候选名,不是完整白名单。**GPS 位置不能通过 `exifInfo` 带上去**(试过的几种名字都被拒),地理位置信息(记录里的 `geoInfo`)怎么写入 **[未知]**。
+上面是试过的候选名,不是完整白名单(已有照片的 `exifInfo` 里还见过 `GPSLatitude` 等,与上表一致)。因此库里**不要把任意 EXIF 键直接透传**:只传已验证的键,或者干脆不传(不传时服务端会自己解析文件,见 2.2 节和 6.6)。
+
+**GPS 位置可以写入,并且会被服务端反向地理编码,进入"地点"搜索** **[已验证]**:带 GPS 的网页上传测试图,几分钟内就能用城市名通过 `search` 检索到。
+
+| 写法 | 进入地点索引? |
+| --- | --- |
+| 经纬度(度分秒有理数,如 `"39/1, 54/1, 27/1"`)加 `GPSLatitudeRef`、`GPSLongitudeRef` | **是**。这是最小集合 |
+| 上面再加海拔、时间戳、日期、处理方式 | 是,但这些都不是必需的 |
+| 只有经纬度,没有 Ref | **否**。创建不报错,但不进地点索引 |
+| 小数格式(`"39.9075"`)加 Ref | **否**。同样不报错 |
+| 只有单个 GPS 字段(只有纬度,或只有经度) | 否 |
+
+记录里的 `geoInfo`(地址)字段在带 GPS 的测试图上没有出现(列表接口里没看到),地点索引却已生效,`geoInfo` 怎么来的 **[未知]**。南半球和西半球的 Ref、写错的 Ref、小数秒等 **[未测]**。
 
 对库的结论:`Upload` 提供一个拍摄时间选项。设了就同时填 `dateModified`(UTC 毫秒)和 `exifInfo.dateTime`(东八区钟表时间,冗余但稳妥);没设时用文件修改时间做 `dateModified`,不要用上传时刻,否则备份回来的照片都堆在今天。
 
@@ -561,6 +707,14 @@ POST /gallery/info/purge         form: id=<照片ID>&ckey=<ms>[&uuid=<userId>]&s
 
 **[已验证] 会被暂时拦截**:2026-10-31 用 Go 库测试时,先在约 13 秒内发了约 40 个读请求(相册列表、时间线、几页 `galleries`、两个文件各 5 次下载),接着在约 80 秒内做了一组写操作(建相册、6 次上传、复制、移动、删除、恢复、彻底删除)。期间 `galleries` 和 `album/list` 开始返回 `code:503`、`reason: user is blocked.`(HTTP 200),同时上传、复制、移动、回收站 `deleted_v2` 和云盘接口仍然正常。约 4 分钟后自动恢复。触发阈值和拦截时长 **[未知]**。库把 503 映射成 `ErrBlocked`,不自动重试;批量任务(备份)遇到它应当停下,稍后再跑。
 
+**搜索类接口更容易触发** **[已验证]**:另一次在浏览器会话里测搜索时,约 2 分钟内向 `search`、`navigation`、`result`、`image/list` 等读接口发了 20 多个请求(其中连续 8 到 10 个 `search`、`navigation`,几乎没有间隔),之后 `/gallery/user/*` 的**所有读接口**(`search`、`navigation`、`galleries`、`album/list`)都返回 503。此时云盘接口(`/drive/*`)和 `/status/alldetail` 正常;写接口当时没测。约 3 到 4 分钟后恢复。
+
+对照:同一个会话里**顺序**翻页 `galleries` 46 次(`pageSize=200`,每次约 3.5 秒,共 163 秒)没有触发;恢复后把所有相册读请求(包括 `search`、`result`、`image/list`)的间隔加到 4 到 5 秒,又发了上百个请求,没有再触发,包括把"风景"分类的 7+7 页 `image/list` 翻完。所以触发看的是**短时间内的请求密度**,不是总量。阈值 **[未知]**,我没有刻意去试。
+
+对库的建议:相册读请求加最小间隔(3 到 5 秒是已验证安全的量级),搜索和导航不要连发;遇到 503 整个进程里的相册读请求一起暂停数分钟,不要逐个重试。
+
+库的实际做法:没有加最小间隔(按顺序请求、用户触发的搜索都没有触发过拦截)。只做了一件事:任何相册 GET 收到 503 后,本进程里的相册 GET 在 5 分钟内直接在本地返回 `ErrBlocked`,不再发出;写接口不受影响。CLI 的 `search` 默认取完全部结果再按拍摄时间排序(每 100 张一个请求,"风景" 695 张共 9 个请求),`--unsorted` 时只取够显示的页数。以后遇到拦截再调整。
+
 ---
 
 ## 10. 待办
@@ -569,16 +723,16 @@ POST /gallery/info/purge         form: id=<照片ID>&ckey=<ms>[&uuid=<userId>]&s
 2. **端到端加密(E2EE)**:启动时调用了 `/mic/keybag/v1/getEncInfo?hsid=2&appId=micloud`,当前账号看起来未开启(上传请求里 `isClientUploadThumbnail=false`),开启后的 `encryptInfo`、客户端缩略图路径没有测。
 3. **共享相册**:`isShared=true` 的列表、`toSharedAlbumId`、`share/image/*`。账号里没有共享相册可供测试。
 4. **真实的小米实况照片**:需要一张手机拍的动态照片,验证 6.7 的"部分验证"。另有 HEIC/HEIF、AVCI:网页上传控件接受这些格式(`image/*, video/*, .avci, .heic, .heif`),没有测。
-5. **`exifInfo.dateTime` 格式不对时的最终日期**(6.5):创建阶段不报错,没走到提交。GPS/地理位置怎么写入;`exifInfo` 白名单的完整字段。
+5. **`exifInfo`**:`dateTime` 格式不对时的最终日期(6.5,创建阶段不报错,没走到提交);白名单的完整字段;GPS 的南半球/西半球 Ref、写错的 Ref、小数秒;`geoInfo` 是怎么生成的、什么时候出现。
 6. **增量同步**:`allitems` 的 `tag` 游标翻页、`limit` 上限、`syncIgnoreTag` 的含义;`deleted_v2` 的 `maxTag` 翻页。
 7. **`temp` 记录**:创建后没提交成功的记录删不掉(50008)。是否占配额、是否会被服务端定期清理、能否对同一 ID 续传(创建后补传块再提交)。测试中前后留下了十几条这种记录,尚未观察到它们消失。
 8. **秒传的范围**:跨相册、跨账号的 SHA-1 去重;块级去重(`is_existed:1`)。
-9. **分类下的照片**:`navigation` 返回的人物/地点/分类,点进去的列表接口(`gallery.i.mi.com/result` 对应的数据请求)。
+9. **搜索的剩余部分**:`facet` 参数的取值范围;`low` 精度在其他查询上是否与 `high` 有差别;`image/list` 结果的排序依据;共享相册和端到端加密下的搜索行为。
 10. **`prepare` 的其他状态**:新账号首次使用时的返回值。
 11. **相册的更多边界**:改名重名、长度上限、除 `/` 外的特殊字符,系统相册(相机、截屏、私密)能否上传、改名、删除。
 12. **容量用尽**时上传的错误码。
 13. **视频**:转码完成后 `videoTranscodingStatus` 的取值和耗时;2.9 GB 级别大文件的上传、下载稳定性。
-14. **并发读取**:总览翻页是顺序请求测的(163 秒/8992 条),并发翻页或并发下载的限流上限未测。
+14. **并发读取与限流阈值**:总览翻页是顺序请求测的(163 秒/8992 条),并发翻页或并发下载的限流上限未测;503 的触发阈值和拦截时长只知道量级(见第 9 节)。
 
 ---
 
@@ -598,4 +752,7 @@ POST /gallery/info/purge         form: id=<照片ID>&ckey=<ms>[&uuid=<userId>]&s
 - 同名不同内容的上传会并存,后一个被改名为 `<名>_<毫秒时间戳>.<扩展名>`;文件名不区分大小写。备份到本地时按"同一相册内文件名大小写不敏感"去重,且名字不要假设是唯一的。
 - 删除相册要先清空。删除照片是软删除,要释放空间还得 `purge`。
 - 所有写接口的幂等性:新建相册同名、移动、复制、删除、恢复、彻底删除都是幂等的,重试安全。
+- 搜索:`search` 只负责返回建议项,取照片要再走 `result` 和 `image/list`(4.5 到 4.7)。建议项的 `url` 参数原样转发,`query` 串不要自己构造。只调 `accuracyMode=high`,`num` 最大 100。搜索**不支持文件名和图片文字**,这两类要在客户端拉全量后过滤。
+- 限流:搜索和导航接口更容易触发 503(第 9 节)。相册读请求加最小间隔,不要逐字符联想式搜索;503 单独处理,不自动重试。
+- 上传带元信息:`exifInfo` 是严格白名单,不要透传任意 EXIF 键,未知键会让整个上传被拒。需要保留位置时,写度分秒格式的经纬度加两个 Ref,服务端会据此建地点索引(6.5)。
 - 不要对 `retriable:true` 自动重试(同云盘)。

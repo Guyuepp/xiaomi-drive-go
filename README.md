@@ -13,7 +13,7 @@ An unofficial Go client library and CLI for Xiaomi Cloud Drive (小米云盘, `i
 - **登录**:扫码登录(推荐)、短信验证码登录、Cookie 导入。不支持账号密码登录。
 - **长期免登录**:保存 `passToken`(约 30 天,每次使用后顺延),`serviceToken` 过期时自动换新,后台每 5 分钟续期。
 - **文件操作**:列目录、按路径查找、搜索、容量、Range 下载、4 MiB 分块并发上传(含秒传)、新建目录、重命名、移动、复制、删除、回收站。
-- **云相册**:列相册、按日期和相册列照片、下载照片和视频(支持 Range)、上传到相册并指定拍摄日期、整库备份、相册的新建/改名/删除、照片的移动/复制/删除、相册回收站。
+- **云相册**:列相册、按日期和相册列照片、按分类/地点/时间/人物搜索、下载照片和视频(支持 Range)、上传到相册并指定拍摄日期、整库备份、相册的新建/改名/删除、照片的移动/复制/删除、相册回收站。
 - **服务端行为的处理**:名称规则本地校验;异步任务即使返回成功也检查 `failedRecords`;移动、复制、重命名冲突时返回明确错误。
 
 ## 安装 CLI
@@ -47,7 +47,8 @@ micloud search <关键词>
 micloud trash ls|restore <id>|purge <id>
 
 micloud gallery albums           # 云相册:列相册
-micloud gallery ls [相册] [--from YYYY-MM-DD] [--to YYYY-MM-DD] [--video]
+micloud gallery ls [相册] [--from YYYY-MM-DD] [--to YYYY-MM-DD] [--video] [--name 子串]
+micloud gallery search <关键词> [--pick 编号] [--limit 张数] [--unsorted]
 micloud gallery get <照片ID> [-o 输出]
 micloud gallery put <本地文件> <相册> [--date "YYYY-MM-DD HH:MM:SS"]
 micloud gallery backup <目录> [--album 相册] [--skip-private] [-j 并发]
@@ -63,6 +64,8 @@ micloud gallery trash ls|restore <id>|purge <id>
 - `<相册>` 写相册名或 ID。相机是 `1`,截屏是 `2`,私密是 `1000`。
 - `backup` 默认备份总览加私密相册,这就是全部照片和视频(私密相册不在总览里)。文件按相册分子目录保存,下载后核对 SHA-1,修改时间设为拍摄日期。本地已有同名且大小相同的文件会跳过,中断后重跑即可。
 - 服务端不读取文件里的 EXIF 拍摄日期。`put` 默认按文件修改时间归档,用 `--date` 可以指定拍摄时间。
+- `search` 用的是服务端搜索,能搜分类(风景、文档……)、地点、时间、人物和相册名,搜不了文件名和图片里的文字。它先列出服务端给的建议项,选一项后再列出照片;可以在终端里输入编号,也可以用 `--pick` 指定。服务端返回的顺序不是按日期的,所以默认会取完全部结果,按拍摄时间从新到旧显示最新的 100 张,`--limit` 调整张数,`--limit 0` 显示全部;结果多时取完要一会儿(每 100 张一个请求)。`--unsorted` 按服务端顺序边取边显示,够数就停。结果不包含私密相册。
+- 按文件名找用 `ls --name`,它在本地过滤全部照片(包括私密相册),照片多时要几分钟。
 - 同一相册里上传同名但内容不同的文件时,服务端会把新文件改名为 `名称_<毫秒时间戳>.扩展名`。
 - 移动照片后照片 ID 会变。
 - 短时间内请求太多时,小米会暂时拒绝这个账号的相册请求(`user is blocked`),等几分钟就会恢复。`backup` 遇到这种情况会停下来。
