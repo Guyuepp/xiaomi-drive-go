@@ -3,6 +3,7 @@ package xiaomidrive
 import (
 	"errors"
 	"fmt"
+	"regexp"
 	"strings"
 )
 
@@ -31,6 +32,17 @@ var (
 	// ErrIsDir is returned when a file was expected.
 	ErrIsDir = errors.New("xiaomidrive: is a folder")
 
+	// ErrAlbumNotEmpty means a gallery album still holds photos and cannot
+	// be deleted (50014).
+	ErrAlbumNotEmpty = errors.New("xiaomidrive: album is not empty")
+	// ErrE2EEUnsupported means the account has gallery end-to-end
+	// encryption on, which this library does not implement.
+	ErrE2EEUnsupported = errors.New("xiaomidrive: gallery end-to-end encryption is not supported")
+	// ErrBlocked means the service is refusing gallery requests for this
+	// account ("user is blocked", code 503), typically after many requests in
+	// a short time. Stop and try again later.
+	ErrBlocked = errors.New("xiaomidrive: gallery requests are blocked for now")
+
 	// ErrQRExpired means the QR code timed out before it was confirmed.
 	ErrQRExpired = errors.New("xiaomidrive: QR code expired")
 	// ErrCaptchaRequired means the account site asked for a captcha.
@@ -53,7 +65,43 @@ const (
 	CodeIntoSelf        = 11010
 	CodeStorage         = 50005
 	CodeQRExpired       = 70031
+
+	// Gallery (/gallery/...) codes. 10008 there also means "no such photo".
+	CodeGallerySystem        = 10001
+	CodeGalleryTempRecord    = 50008
+	CodeGalleryAlbumNotFound = 50012
+	CodeGalleryAlbumNotEmpty = 50014
+	CodeGalleryStatus        = 50050
+	CodeGalleryNotMedia      = 50051
+	CodeGalleryBlocked       = 503
 )
+
+// gallerySentinelFor maps gallery error codes, whose meanings differ from the
+// drive's for the same numbers.
+func gallerySentinelFor(code int, reason string) error {
+	switch code {
+	case 401:
+		return ErrUnauthorized
+	case CodeInvalidArgument:
+		if strings.Contains(reason, "unknown media type") {
+			return ErrNotFound
+		}
+		return ErrInvalidArgument
+	case CodeMissingArgument, CodeUnknown:
+		return ErrInvalidArgument
+	case CodeGalleryAlbumNotFound, CodeGalleryStatus, CodeGalleryNotMedia:
+		return ErrNotFound
+	case CodeGalleryAlbumNotEmpty:
+		return ErrAlbumNotEmpty
+	case CodeGalleryBlocked:
+		return ErrBlocked
+	}
+	return nil
+}
+
+// userIDInReason matches the account ID the service embeds in some error
+// reasons ("userId:123,..."); it is redacted from error strings.
+var userIDInReason = regexp.MustCompile(`(?i)(userId:)\s*\d+`)
 
 func sentinelFor(code int) error {
 	switch code {
@@ -97,7 +145,7 @@ func (e *APIError) Error() string {
 	}
 	fmt.Fprintf(&b, "code %d", e.Code)
 	if e.Reason != "" {
-		fmt.Fprintf(&b, ": %s", e.Reason)
+		fmt.Fprintf(&b, ": %s", userIDInReason.ReplaceAllString(e.Reason, "${1}<redacted>"))
 	} else if e.Description != "" {
 		fmt.Fprintf(&b, ": %s", e.Description)
 	}
@@ -108,7 +156,13 @@ func (e *APIError) Is(target error) bool {
 	if e.HTTPStatus == 401 {
 		return target == ErrUnauthorized
 	}
-	return sentinelFor(e.Code) == target && target != nil
+	if target == nil {
+		return false
+	}
+	if strings.HasPrefix(e.Endpoint, "/gallery/") {
+		return gallerySentinelFor(e.Code, e.Reason) == target
+	}
+	return sentinelFor(e.Code) == target
 }
 
 // FailedRecord is one entry of a task's failedRecords list.

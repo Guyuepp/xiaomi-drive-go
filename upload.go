@@ -165,19 +165,21 @@ type kssCreate struct {
 	SplitSize  int64          `json:"splitSize"`
 }
 
+type kssBlockMeta struct {
+	IsExisted  int    `json:"is_existed"`
+	BlockMeta  string `json:"block_meta"`
+	CommitMeta string `json:"commit_meta"`
+}
+
 type createResp struct {
 	Exists   flexBool   `json:"exists"`
 	ID       flexString `json:"id"`
 	UploadID string     `json:"uploadId"`
 	KSS      struct {
-		Stat       string   `json:"stat"`
-		NodeURLs   []string `json:"node_urls"`
-		FileMeta   string   `json:"file_meta"`
-		BlockMetas []struct {
-			IsExisted  int    `json:"is_existed"`
-			BlockMeta  string `json:"block_meta"`
-			CommitMeta string `json:"commit_meta"`
-		} `json:"block_metas"`
+		Stat       string         `json:"stat"`
+		NodeURLs   []string       `json:"node_urls"`
+		FileMeta   string         `json:"file_meta"`
+		BlockMetas []kssBlockMeta `json:"block_metas"`
 	} `json:"kss"`
 }
 
@@ -277,7 +279,7 @@ func (c *Client) uploadSpooled(ctx context.Context, parentID, name string, sp *s
 		return nil, fmt.Errorf("xiaomidrive: upload: server expected %d blocks, have %d", n, len(sp.blocks))
 	}
 
-	commitMetas, err := c.uploadBlocks(ctx, sp, &cr, opts)
+	commitMetas, err := c.uploadBlocks(ctx, cr.KSS.NodeURLs[0], cr.KSS.FileMeta, cr.KSS.BlockMetas, sp, opts)
 	if err != nil {
 		return nil, err
 	}
@@ -308,10 +310,13 @@ func (c *Client) uploadSpooled(ctx context.Context, parentID, name string, sp *s
 	return c.Get(ctx, string(commit.ID))
 }
 
-// uploadBlocks uploads every block (concurrently) and returns their commit
-// metas in block order.
-func (c *Client) uploadBlocks(ctx context.Context, sp *spooled, cr *createResp, opts UploadOptions) ([]string, error) {
-	node := strings.TrimRight(cr.KSS.NodeURLs[0], "/")
+// uploadBlocks uploads every block (concurrently) to a KSS node and returns
+// their commit metas in block order. Drive and gallery uploads share it.
+func (c *Client) uploadBlocks(ctx context.Context, nodeURL, fileMeta string, metas []kssBlockMeta, sp *spooled, opts UploadOptions) ([]string, error) {
+	if len(metas) != len(sp.blocks) {
+		return nil, fmt.Errorf("xiaomidrive: upload: server expected %d blocks, have %d", len(metas), len(sp.blocks))
+	}
+	node := strings.TrimRight(nodeURL, "/")
 	commitMetas := make([]string, len(sp.blocks))
 
 	var (
@@ -325,7 +330,7 @@ func (c *Client) uploadBlocks(ctx context.Context, sp *spooled, cr *createResp, 
 	defer cancel()
 
 	for i := range sp.blocks {
-		meta := cr.KSS.BlockMetas[i]
+		meta := metas[i]
 		if meta.IsExisted == 1 && meta.CommitMeta != "" {
 			commitMetas[i] = meta.CommitMeta
 			continue
@@ -340,7 +345,7 @@ func (c *Client) uploadBlocks(ctx context.Context, sp *spooled, cr *createResp, 
 			}
 			defer func() { <-sem }()
 
-			cm, err := c.uploadOneBlock(ctx, node, cr.KSS.FileMeta, blockMeta, sp, sp.blocks[i], opts.WrapBody)
+			cm, err := c.uploadOneBlock(ctx, node, fileMeta, blockMeta, sp, sp.blocks[i], opts.WrapBody)
 			mu.Lock()
 			defer mu.Unlock()
 			if err != nil {

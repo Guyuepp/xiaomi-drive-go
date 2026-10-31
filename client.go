@@ -1,15 +1,21 @@
 package xiaomidrive
 
-import "context"
+import (
+	"context"
+	"sync"
+)
 
 // Client is the high-level entry point. It wraps a Session and exposes login
 // and file operations. It is safe for concurrent use.
 //
 // The method set mirrors an OpenList driver (List, Link, MakeDir, Move, Rename,
 // Copy, Remove, Put, GetRoot), so the driver/ adapter can forward to it almost
-// one-to-one.
+// one-to-one. Gallery (photo and video) operations live on Client.Gallery.
 type Client struct {
 	s *Session
+
+	galleryOnce sync.Once
+	gallery     *Gallery
 }
 
 // NewClient builds a client. Supply WithStore to persist credentials across

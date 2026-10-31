@@ -6,6 +6,10 @@
 // operations (list, search, get-by-path, download with Range, chunked and
 // rapid upload, mkdir, rename, move, copy, delete, and the recycle bin).
 //
+// Client.Gallery gives access to the cloud photo library (云相册): albums,
+// listing by day or album, download with Range, upload with a chosen date,
+// move, copy, delete and the gallery trash.
+//
 // The API is reverse-engineered from the web client and may change without
 // notice. This project is not affiliated with Xiaomi.
 //
