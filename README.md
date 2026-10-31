@@ -111,7 +111,7 @@ rclone 通过 OpenList 的 WebDAV 挂载,服务文件是 `~/.config/systemd/user
 
 - rclone 使用单独的 OpenList 用户 `rclone`:只能访问 `/micloud`,只有上传、新建目录、重命名、移动、复制、删除和 WebDAV 权限。它的密码只存在 `~/.config/rclone/rclone.conf`(权限 600,rclone 的 obscure 只是混淆,不是加密)。
 - 开启了 `--vfs-cache-mode full`:写入先进本地缓存 `~/.cache/rclone`,关闭文件后后台上传;缓存上限 10G,保留 24 小时。
-- **空文件不会上传**:`touch` 之类产生的 0 字节文件只存在于本地缓存,rclone 会不断重试并在日志里报 405,写入内容后才会真正上传。
+- **空文件**:服务端不接受 0 字节文件。OpenList 驱动把空文件记在存储配置里(本地占位),列目录时照常显示,写入内容后才真正上传。在 OpenList 网页里编辑这个存储并保存时,这些记录是否保留取决于前端如何提交配置,**没有验证过**。
 
 ```
 systemctl --user status rclone-micloud
@@ -126,7 +126,7 @@ systemctl --user restart rclone-micloud     # 重新挂载
 
 ## 已知限制(详见 `docs/`)
 
-- 不能上传空文件(服务端拒绝 0 字节)。挂载时 `touch` 需本地暂存。
+- 不能上传空文件(服务端拒绝 0 字节)。库返回 `ErrEmptyFile`;OpenList 驱动用本地占位兼容。
 - 没有原地覆盖写接口;`Overwrite` 用“上传临时名 → 删旧 → 改名”模拟,**文件 ID 会变**。
 - 名称大小写不敏感;`rename`/`mkdir` 后列表有 0.2–0.6 秒延迟。
 - 任务型操作(移动/复制/删除)即使 `SUCCESS` 也可能在 `failedRecords` 里有同名冲突,库已检查并返回 `TaskError`。
