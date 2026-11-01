@@ -153,15 +153,29 @@ func (c *Client) LoginWithCookies(ctx context.Context, creds Credentials) error 
 	if creds.DeviceFingerprint == "" {
 		creds.DeviceFingerprint = newFingerprint()
 	}
-	c.s.setCredentials(creds)
-
+	// Validate in an isolated session. A failed import must not replace the
+	// active account or overwrite its persisted credentials.
+	c.s.refreshMu.Lock()
+	defer c.s.refreshMu.Unlock()
+	candidate := newSession(WithLogger(c.s.logf))
+	candidate.creds = creds
+	candidate.http, candidate.noRedir = c.s.http, c.s.noRedir
+	var validationErr error
 	if creds.ServiceToken != "" {
-		if _, err := c.s.get(ctx, "/status/lite/setting", url.Values{"type": {"AutoRenewal"}, "inactiveTime": {"10"}}); err == nil {
-			return nil
+		if _, err := candidate.get(ctx, "/status/lite/setting", url.Values{"type": {"AutoRenewal"}, "inactiveTime": {"10"}}); err == nil {
+			return c.s.setCredentials(candidate.Credentials())
+		} else {
+			validationErr = err
 		}
 	}
 	if creds.PassToken != "" {
-		return c.s.Refresh(ctx)
+		if err := candidate.Refresh(ctx); err != nil {
+			return err
+		}
+		return c.s.setCredentials(candidate.Credentials())
+	}
+	if validationErr != nil {
+		return validationErr
 	}
 	return ErrUnauthorized
 }
@@ -385,7 +399,10 @@ func (c *Client) finishLogin(ctx context.Context, userID, cUserID, passToken, lo
 	if userID == "" {
 		userID = cookieUserID
 	}
-	c.s.setCredentials(Credentials{
+	if userID == "" {
+		return &LoginError{Step: "sts", Description: "no userId issued"}
+	}
+	return c.s.setCredentials(Credentials{
 		UserID:            userID,
 		PassToken:         passToken,
 		ServiceToken:      token,
@@ -393,5 +410,4 @@ func (c *Client) finishLogin(ctx context.Context, userID, cUserID, passToken, lo
 		DeviceFingerprint: fp,
 		CUserID:           cUserID,
 	})
-	return nil
 }

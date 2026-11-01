@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"strings"
 	"time"
 )
 
@@ -55,6 +56,16 @@ func (c *Client) Link(ctx context.Context, id string) (*Link, error) {
 // Download opens a file for reading. offset is the starting byte; length < 0
 // reads to the end. The caller must close the returned reader.
 func (c *Client) Download(ctx context.Context, id string, offset, length int64) (io.ReadCloser, error) {
+	rangeHeader, err := downloadRange(offset, length)
+	if err != nil {
+		return nil, err
+	}
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	if length == 0 {
+		return io.NopCloser(strings.NewReader("")), nil
+	}
 	l, err := c.Link(ctx, id)
 	if err != nil {
 		return nil, err
@@ -64,22 +75,14 @@ func (c *Client) Download(ctx context.Context, id string, offset, length int64) 
 		return nil, err
 	}
 	req.Header.Set("User-Agent", defaultUserAgent)
-	if offset > 0 || length >= 0 {
-		if length >= 0 {
-			req.Header.Set("Range", fmt.Sprintf("bytes=%d-%d", offset, offset+length-1))
-		} else {
-			req.Header.Set("Range", fmt.Sprintf("bytes=%d-", offset))
-		}
+	if rangeHeader != "" {
+		req.Header.Set("Range", rangeHeader)
 	}
 	resp, err := c.s.http.Do(req)
 	if err != nil {
 		return nil, err
 	}
-	if resp.StatusCode != http.StatusOK && resp.StatusCode != http.StatusPartialContent {
-		resp.Body.Close()
-		return nil, fmt.Errorf("xiaomidrive: download %s: HTTP %d", id, resp.StatusCode)
-	}
-	return resp.Body, nil
+	return downloadResponse(resp, offset, length, "download "+id)
 }
 
 // Open reads an entire file from the start.

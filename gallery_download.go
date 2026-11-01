@@ -80,6 +80,16 @@ func stripJSONP(b []byte) ([]byte, error) {
 // length < 0 reads to the end. The bytes are the original upload; their SHA-1
 // matches Photo.SHA1. The caller must close the returned reader.
 func (g *Gallery) Download(ctx context.Context, id string, offset, length int64) (io.ReadCloser, error) {
+	rangeHeader, err := downloadRange(offset, length)
+	if err != nil {
+		return nil, err
+	}
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	if length == 0 {
+		return io.NopCloser(strings.NewReader("")), nil
+	}
 	t, err := g.resolveDownload(ctx, id)
 	if err != nil {
 		return nil, err
@@ -92,41 +102,21 @@ func (g *Gallery) Download(ctx context.Context, id string, offset, length int64)
 	}
 	req.Header.Set("User-Agent", defaultUserAgent)
 	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
-	ranged := offset > 0 || length >= 0
-	if ranged {
-		if length >= 0 {
-			req.Header.Set("Range", fmt.Sprintf("bytes=%d-%d", offset, offset+length-1))
-		} else {
-			req.Header.Set("Range", fmt.Sprintf("bytes=%d-", offset))
-		}
+	if rangeHeader != "" {
+		req.Header.Set("Range", rangeHeader)
 	}
 	resp, err := g.c.s.http.Do(req)
 	if err != nil {
 		return nil, err
 	}
-	switch {
-	case resp.StatusCode == http.StatusPartialContent:
-		return resp.Body, nil
-	case resp.StatusCode == http.StatusOK && offset == 0:
-		// A full body is acceptable when reading from the start.
-	default:
-		resp.Body.Close()
-		return nil, fmt.Errorf("xiaomidrive: gallery download %s: HTTP %d", id, resp.StatusCode)
-	}
 	// A storage-node error is HTTP 200 with a small JSON body
 	// ({"stat":"ERR_..."}); file bodies come as application/octet-stream.
-	if strings.HasPrefix(resp.Header.Get("Content-Type"), "application/json") {
+	if (resp.StatusCode == http.StatusOK || resp.StatusCode == http.StatusPartialContent) && strings.HasPrefix(resp.Header.Get("Content-Type"), "application/json") {
 		msg, _ := io.ReadAll(io.LimitReader(resp.Body, 4096))
 		resp.Body.Close()
 		return nil, fmt.Errorf("xiaomidrive: gallery download %s: storage node error: %s", id, bytes.TrimSpace(msg))
 	}
-	if length >= 0 {
-		return struct {
-			io.Reader
-			io.Closer
-		}{io.LimitReader(resp.Body, length), resp.Body}, nil
-	}
-	return resp.Body, nil
+	return downloadResponse(resp, offset, length, "gallery download "+id)
 }
 
 // Open reads a whole photo or video from the start.

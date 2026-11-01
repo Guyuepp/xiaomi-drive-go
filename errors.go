@@ -228,6 +228,20 @@ func (e *TaskError) Is(target error) bool {
 	return false
 }
 
+// TaskWaitError preserves the server task ID when waiting is interrupted.
+// The remote operation may still finish; use Client.WaitTask to check it later.
+type TaskWaitError struct {
+	Op     string
+	TaskID string
+	Err    error
+}
+
+func (e *TaskWaitError) Error() string {
+	return fmt.Sprintf("xiaomidrive: %s task %s: %v (remote task may still be running)", e.Op, e.TaskID, e.Err)
+}
+
+func (e *TaskWaitError) Unwrap() error { return e.Err }
+
 // LoginError is a failed step of a login flow on account.xiaomi.com.
 type LoginError struct {
 	Step        string

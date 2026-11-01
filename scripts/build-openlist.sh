@@ -31,6 +31,14 @@ ldflags="-w -s \
   -X '$pkg.Version=v4-micloud-$commit' \
   -X '$pkg.WebVersion=${web_version#v}'"
 
-go build -tags=jsoniter -ldflags="$ldflags" -o "$dest.new" .
+# Build against this checkout's SDK, rather than the fork's released SDK
+# dependency. Keep the workspace temporary so standalone module builds work.
+build_workspace="$(mktemp -d)"
+trap 'rm -rf "$build_workspace"' EXIT
+(
+  cd "$build_workspace"
+  GOWORK=off go work init "$root" "$src"
+)
+GOWORK="$build_workspace/go.work" go build -tags=jsoniter -ldflags="$ldflags" -o "$dest.new" .
 mv "$dest.new" "$dest"
 echo "installed $dest ($("$dest" version 2>/dev/null | grep -i '^version' || true))"

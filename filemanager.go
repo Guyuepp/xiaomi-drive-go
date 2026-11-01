@@ -102,11 +102,21 @@ type taskResult struct {
 }
 
 func (c *Client) waitTask(ctx context.Context, op, taskID string, interval time.Duration) error {
-	deadline := time.Now().Add(2 * time.Minute)
+	if taskID == "" {
+		return fmt.Errorf("xiaomidrive: %s: missing task id", op)
+	}
+	if c.s.taskTimeout > 0 {
+		var cancel context.CancelFunc
+		ctx, cancel = context.WithTimeout(ctx, c.s.taskTimeout)
+		defer cancel()
+	}
 	for {
 		q := url.Values{"taskId": {taskID}}
 		raw, err := c.s.get(ctx, "/drive/v2/user/records/taskquery", q)
 		if err != nil {
+			if ctx.Err() != nil {
+				return &TaskWaitError{Op: op, TaskID: taskID, Err: ctx.Err()}
+			}
 			return err
 		}
 		var t taskResult
@@ -122,15 +132,18 @@ func (c *Client) waitTask(ctx context.Context, op, taskID string, interval time.
 		case "FAILED":
 			return taskErrorFrom(op, taskID, &t)
 		}
-		if time.Now().After(deadline) {
-			return fmt.Errorf("xiaomidrive: %s task %s timed out", op, taskID)
-		}
 		select {
 		case <-ctx.Done():
-			return ctx.Err()
+			return &TaskWaitError{Op: op, TaskID: taskID, Err: ctx.Err()}
 		case <-time.After(interval):
 		}
 	}
+}
+
+// WaitTask resumes waiting for a task whose ID was returned in a TaskWaitError.
+// A timeout stops local waiting; it does not cancel the remote operation.
+func (c *Client) WaitTask(ctx context.Context, taskID string) error {
+	return c.waitTask(ctx, "file operation", taskID, 200*time.Millisecond)
 }
 
 func taskErrorFrom(op, taskID string, t *taskResult) error {

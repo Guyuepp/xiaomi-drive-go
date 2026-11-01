@@ -3,8 +3,9 @@
 package main
 
 import (
-	"bufio"
+	"bytes"
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -87,6 +88,7 @@ func usage() {
   micloud login sms <手机号>               短信验证码登录
   micloud login cookie --user <id> --service <token> [--pass <passToken>]
                                           用 Cookie 登录(serviceToken 短期,passToken 长期)
+  micloud login cookie --stdin             从标准输入读取 JSON 凭据，避免令牌出现在进程参数中
   micloud logout                          删除本地保存的凭据
   micloud export                          打印 userId 和 passToken,用于填写 OpenList 存储配置
 
@@ -201,27 +203,71 @@ func loginSMS(ctx context.Context, c *xiaomidrive.Client, phone string) error {
 }
 
 func loginCookie(ctx context.Context, c *xiaomidrive.Client, args []string) error {
-	var creds xiaomidrive.Credentials
-	for i := 0; i < len(args); i++ {
-		switch args[i] {
-		case "--user":
-			i++
-			creds.UserID = arg(args, i)
-		case "--service":
-			i++
-			creds.ServiceToken = arg(args, i)
-		case "--pass":
-			i++
-			creds.PassToken = arg(args, i)
-		default:
-			return fmt.Errorf("未知参数 %q", args[i])
-		}
+	creds, err := parseCookieCredentials(args, os.Stdin)
+	if err != nil {
+		return err
 	}
 	if err := c.LoginWithCookies(ctx, creds); err != nil {
 		return err
 	}
 	fmt.Println("登录成功。")
 	return nil
+}
+
+func parseCookieCredentials(args []string, in io.Reader) (xiaomidrive.Credentials, error) {
+	var creds xiaomidrive.Credentials
+	stdin, flags := false, false
+	for i := 0; i < len(args); i++ {
+		switch args[i] {
+		case "--stdin":
+			if stdin {
+				return creds, errors.New("--stdin 不能重复")
+			}
+			stdin = true
+		case "--user", "--service", "--pass":
+			flag := args[i]
+			i++
+			if i >= len(args) || args[i] == "" || strings.HasPrefix(args[i], "--") {
+				return creds, fmt.Errorf("%s 缺少值", flag)
+			}
+			flags = true
+			switch flag {
+			case "--user":
+				creds.UserID = args[i]
+			case "--service":
+				creds.ServiceToken = args[i]
+			case "--pass":
+				creds.PassToken = args[i]
+			}
+		default:
+			return creds, errors.New("未知 Cookie 登录参数")
+		}
+	}
+	if stdin {
+		if flags {
+			return creds, errors.New("--stdin 不能与 --user、--service、--pass 混用")
+		}
+		const maxInput = 1 << 20
+		body, err := io.ReadAll(io.LimitReader(in, maxInput+1))
+		if err != nil {
+			return creds, fmt.Errorf("读取凭据失败: %w", err)
+		}
+		if len(body) > maxInput {
+			return creds, errors.New("JSON 凭据超过 1 MiB")
+		}
+		dec := json.NewDecoder(bytes.NewReader(body))
+		dec.DisallowUnknownFields()
+		if err := dec.Decode(&creds); err != nil {
+			return creds, errors.New("JSON 凭据无效")
+		}
+		if dec.Decode(new(json.RawMessage)) != io.EOF {
+			return creds, errors.New("只允许输入一个 JSON 凭据对象")
+		}
+	}
+	if creds.UserID == "" || (creds.ServiceToken == "" && creds.PassToken == "") {
+		return creds, errors.New("需要 userId 和 serviceToken 或 passToken")
+	}
+	return creds, nil
 }
 
 func cmdExport() error {
@@ -501,12 +547,7 @@ func cmdGet(ctx context.Context, args []string) error {
 		return err
 	}
 	defer rc.Close()
-	dst, err := os.Create(out)
-	if err != nil {
-		return err
-	}
-	defer dst.Close()
-	n, err := io.Copy(dst, rc)
+	n, err := saveDownload(ctx, out, rc, f.GetSize(), f.SHA1)
 	if err != nil {
 		return err
 	}
@@ -652,12 +693,24 @@ func readLine() (string, error) {
 }
 
 func readLineFrom(in io.Reader) (string, error) {
-	r := bufio.NewReader(in)
-	line, err := r.ReadString('\n')
-	if err != nil && err != io.EOF {
-		return "", err
+	var line strings.Builder
+	var b [1]byte
+	for {
+		n, err := io.ReadFull(in, b[:])
+		if n > 0 {
+			if b[0] == '\n' {
+				break
+			}
+			line.WriteByte(b[0])
+		}
+		if err != nil {
+			if err != io.EOF {
+				return "", err
+			}
+			break
+		}
 	}
-	return strings.TrimRight(line, "\r\n"), nil
+	return strings.TrimRight(line.String(), "\r"), nil
 }
 
 func humanBytes(n int64) string {

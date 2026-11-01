@@ -37,8 +37,11 @@ const galleryPageSize = 200
 type Gallery struct {
 	c *Client
 
-	mu    sync.Mutex
-	ready bool
+	mu          sync.Mutex
+	ready       bool
+	readyUserID string
+	readGate    chan struct{}
+	nextRead    time.Time
 
 	// blockMu guards blockedUntil: after a "user is blocked" (503) answer,
 	// gallery reads fail locally until then instead of reaching the service.
@@ -53,7 +56,7 @@ const galleryBlockCooldown = 5 * time.Minute
 
 // Gallery returns the client's photo library.
 func (c *Client) Gallery() *Gallery {
-	c.galleryOnce.Do(func() { c.gallery = &Gallery{c: c, now: time.Now} })
+	c.galleryOnce.Do(func() { c.gallery = &Gallery{c: c, now: time.Now, readGate: make(chan struct{}, 1)} })
 	return c.gallery
 }
 
@@ -63,6 +66,21 @@ func (g *Gallery) get(ctx context.Context, path string, q url.Values) (json.RawM
 	if err := g.checkBlocked(); err != nil {
 		return nil, err
 	}
+	// Serialize request starts so concurrent backup workers share the same
+	// minimum interval. Waiting for the gate and for the interval is cancelable.
+	select {
+	case g.readGate <- struct{}{}:
+	case <-ctx.Done():
+		return nil, ctx.Err()
+	}
+	defer func() { <-g.readGate }()
+	if err := sleepCtx(ctx, g.nextRead.Sub(g.now())); err != nil {
+		return nil, err
+	}
+	if err := g.checkBlocked(); err != nil {
+		return nil, err
+	}
+	g.nextRead = g.now().Add(g.c.s.galleryReadInterval)
 	raw, err := g.c.s.get(ctx, path, q)
 	g.noteBlocked(err)
 	return raw, err
@@ -94,9 +112,11 @@ func (g *Gallery) noteBlocked(err error) {
 func (g *Gallery) ensure(ctx context.Context) error {
 	g.mu.Lock()
 	defer g.mu.Unlock()
-	if g.ready {
+	userID := g.c.s.userID()
+	if g.ready && g.readyUserID == userID {
 		return nil
 	}
+	g.ready = false
 	if err := g.checkE2EE(ctx); err != nil {
 		return err
 	}
@@ -104,32 +124,29 @@ func (g *Gallery) ensure(ctx context.Context) error {
 		return err
 	}
 	g.ready = true
+	g.readyUserID = userID
 	return nil
 }
 
 // checkE2EE refuses accounts with gallery end-to-end encryption, whose content
 // this library would download as ciphertext. An account without it reports
-// e2eeStatus "close"; any other non-empty value is treated as encrypted. If
-// the status endpoint itself fails (other than for auth), the check is
-// skipped rather than blocking the gallery.
+// e2eeStatus "close". An unknown or unavailable status never permits access.
 func (g *Gallery) checkE2EE(ctx context.Context) error {
 	q := url.Values{"hsid": {"2"}, "appId": {"micloud"}}
 	raw, err := g.get(ctx, "/mic/keybag/v1/getEncInfo", q)
 	if err != nil {
-		if errors.Is(err, ErrUnauthorized) || ctx.Err() != nil {
-			return err
-		}
-		g.c.s.logf("xiaomidrive: gallery: e2ee status check skipped: %v", err)
-		return nil
+		return fmt.Errorf("xiaomidrive: gallery e2ee status: %w", err)
 	}
 	var d struct {
 		E2EEStatus string `json:"e2eeStatus"`
 	}
 	if err := json.Unmarshal(raw, &d); err != nil {
-		g.c.s.logf("xiaomidrive: gallery: e2ee status decode: %v", err)
-		return nil
+		return fmt.Errorf("xiaomidrive: gallery e2ee status decode: %w", err)
 	}
-	if d.E2EEStatus != "" && d.E2EEStatus != "close" {
+	if d.E2EEStatus == "" {
+		return fmt.Errorf("xiaomidrive: gallery e2ee status is missing")
+	}
+	if d.E2EEStatus != "close" {
 		return fmt.Errorf("%w (e2eeStatus %q)", ErrE2EEUnsupported, d.E2EEStatus)
 	}
 	return nil

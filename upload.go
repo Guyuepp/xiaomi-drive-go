@@ -264,13 +264,13 @@ func (c *Client) uploadSpooled(ctx context.Context, parentID, name string, sp *s
 
 	// Rapid upload: the service already has this content and created the file.
 	if bool(cr.Exists) {
-		if cr.ID != "" {
+		if cr.ID != "" && string(cr.ID) != RootID {
 			if opts.Progress != nil {
 				opts.Progress(sp.size)
 			}
 			return c.Get(ctx, string(cr.ID))
 		}
-		return nil, fmt.Errorf("xiaomidrive: upload: rapid upload reported no id")
+		return nil, fmt.Errorf("xiaomidrive: upload: rapid upload reported no valid file id")
 	}
 	if len(cr.KSS.NodeURLs) == 0 || cr.UploadID == "" {
 		return nil, fmt.Errorf("xiaomidrive: upload: incomplete create response")
@@ -306,6 +306,9 @@ func (c *Client) uploadSpooled(ctx context.Context, parentID, name string, sp *s
 	}
 	if err := json.Unmarshal(raw, &commit); err != nil {
 		return nil, fmt.Errorf("xiaomidrive: upload commit decode: %w", err)
+	}
+	if commit.ID == "" || string(commit.ID) == RootID {
+		return nil, fmt.Errorf("xiaomidrive: upload commit: missing or invalid file id")
 	}
 	return c.Get(ctx, string(commit.ID))
 }
@@ -461,6 +464,9 @@ func (c *Client) Overwrite(ctx context.Context, parentID, name string, r io.Read
 	uploaded, err := c.Upload(ctx, parentID, tmpName, r, opts)
 	if err != nil {
 		return nil, err
+	}
+	if uploaded == nil || uploaded.ID == "" || uploaded.ID == RootID || uploaded.IsDir() {
+		return nil, fmt.Errorf("xiaomidrive: overwrite: upload returned an invalid file")
 	}
 	if old != nil {
 		if err := c.Remove(ctx, []*File{old}); err != nil {

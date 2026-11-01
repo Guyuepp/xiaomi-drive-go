@@ -185,7 +185,7 @@ func (c *Client) MakeDir(ctx context.Context, parentID, name string) (*File, err
 		return nil, fmt.Errorf("xiaomidrive: mkdir decode: %w", err)
 	}
 	f := rec.toFile(nil)
-	if f.Type == "" {
+	if rec.Type == "" {
 		f.Type = TypeFolder
 	}
 	return f, nil

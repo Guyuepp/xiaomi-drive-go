@@ -63,18 +63,31 @@ func (s *FileStore) Load() (*Credentials, error) {
 
 // Save writes the file atomically with 0600 permissions.
 func (s *FileStore) Save(c *Credentials) error {
-	if err := os.MkdirAll(filepath.Dir(s.Path), 0o700); err != nil {
+	dir := filepath.Dir(s.Path)
+	if err := os.MkdirAll(dir, 0o700); err != nil {
 		return err
 	}
 	b, err := json.MarshalIndent(c, "", "  ")
 	if err != nil {
 		return err
 	}
-	tmp := s.Path + ".tmp"
-	if err := os.WriteFile(tmp, b, 0o600); err != nil {
+	f, err := os.CreateTemp(dir, filepath.Base(s.Path)+".tmp-*")
+	if err != nil {
 		return err
 	}
-	return os.Rename(tmp, s.Path)
+	defer os.Remove(f.Name())
+	if _, err := f.Write(b); err != nil {
+		f.Close()
+		return err
+	}
+	if err := f.Sync(); err != nil {
+		f.Close()
+		return err
+	}
+	if err := f.Close(); err != nil {
+		return err
+	}
+	return os.Rename(f.Name(), s.Path)
 }
 
 // memStore is an in-memory Store, the default when none is supplied.
@@ -103,12 +116,17 @@ func (m *memStore) Save(c *Credentials) error {
 type Session struct {
 	mu    sync.RWMutex
 	creds Credentials
+	// persistMu orders credential changes and their snapshots without holding
+	// mu while calling a user-supplied Store.
+	persistMu sync.Mutex
 
 	store   Store
 	http    *http.Client // follows redirects (downloads, storage hosts)
 	noRedir *http.Client // stops at first redirect (sts exchange)
 
-	logf func(string, ...any)
+	logf                func(string, ...any)
+	galleryReadInterval time.Duration
+	taskTimeout         time.Duration
 
 	// refreshMu serialises passToken restores so concurrent 401s trigger a
 	// single exchange.
@@ -138,18 +156,43 @@ func WithLogger(f func(string, ...any)) Option {
 	return func(se *Session) { se.logf = f }
 }
 
+// WithGalleryReadInterval sets the minimum spacing between gallery GETs for
+// this client. The default is 3 seconds; zero disables proactive spacing.
+// The cooldown after ErrBlocked remains enabled.
+func WithGalleryReadInterval(d time.Duration) Option {
+	return func(s *Session) {
+		if d >= 0 {
+			s.galleryReadInterval = d
+		}
+	}
+}
+
+// WithTaskTimeout sets the deadline for waiting on server-side file operations.
+// The default is two minutes; zero uses only the caller's context deadline.
+func WithTaskTimeout(d time.Duration) Option {
+	return func(s *Session) {
+		if d >= 0 {
+			s.taskTimeout = d
+		}
+	}
+}
+
 func newSession(opts ...Option) *Session {
 	s := &Session{
-		store:   &memStore{},
-		http:    newHTTPClient(true, 0),
-		noRedir: newHTTPClient(false, 60*time.Second),
-		logf:    func(string, ...any) {},
-		kaStop:  make(chan struct{}),
+		store:               &memStore{},
+		http:                newHTTPClient(true, 0),
+		noRedir:             newHTTPClient(false, 60*time.Second),
+		logf:                func(string, ...any) {},
+		kaStop:              make(chan struct{}),
+		galleryReadInterval: 3 * time.Second,
+		taskTimeout:         2 * time.Minute,
 	}
 	for _, o := range opts {
 		o(s)
 	}
-	if c, err := s.store.Load(); err == nil && c != nil {
+	if c, err := s.store.Load(); err != nil {
+		s.logf("xiaomidrive: load credentials: %v", err)
+	} else if c != nil {
 		s.creds = *c
 	}
 	return s
@@ -168,19 +211,23 @@ func (s *Session) LoggedIn() bool {
 }
 
 // setCredentials replaces the credentials and persists them.
-func (s *Session) setCredentials(c Credentials) {
+func (s *Session) setCredentials(c Credentials) error {
+	s.persistMu.Lock()
+	defer s.persistMu.Unlock()
+	if err := s.store.Save(&c); err != nil {
+		return fmt.Errorf("xiaomidrive: save credentials: %w", err)
+	}
 	s.mu.Lock()
 	s.creds = c
-	snapshot := s.creds
 	s.mu.Unlock()
-	if err := s.store.Save(&snapshot); err != nil {
-		s.logf("xiaomidrive: save credentials: %v", err)
-	}
+	return nil
 }
 
 // updateServiceToken records a freshly issued serviceToken (and userId) and
 // persists it.
 func (s *Session) updateServiceToken(token, userID string) {
+	s.persistMu.Lock()
+	defer s.persistMu.Unlock()
 	s.mu.Lock()
 	if token != "" {
 		s.creds.ServiceToken = token
@@ -277,6 +324,9 @@ func (s *Session) callWithRetry(ctx context.Context, method, path string, query,
 		if err == nil {
 			return env, status, nil
 		}
+		if status != 0 {
+			return nil, status, err
+		}
 		if ctx.Err() != nil {
 			return nil, 0, ctx.Err()
 		}
@@ -286,6 +336,12 @@ func (s *Session) callWithRetry(ctx context.Context, method, path string, query,
 }
 
 func sleepCtx(ctx context.Context, d time.Duration) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	if d <= 0 {
+		return nil
+	}
 	t := time.NewTimer(d)
 	defer t.Stop()
 	select {
@@ -318,14 +374,37 @@ func (s *Session) callOnce(ctx context.Context, method, path string, query, form
 	if err != nil {
 		return nil, 0, err
 	}
-	// Status endpoints re-issue the serviceToken via Set-Cookie.
-	if tok := setCookieValue(resp, "serviceToken"); tok != "" {
-		s.updateServiceToken(tok, setCookieValue(resp, "userId"))
+	var decoded struct {
+		apiEnvelope
+		Code *int `json:"code"`
 	}
-	var env apiEnvelope
-	if len(body) > 0 {
-		if jerr := json.Unmarshal(stripStart(body), &env); jerr != nil && resp.StatusCode == http.StatusOK {
-			return nil, resp.StatusCode, fmt.Errorf("xiaomidrive: %s: decode response: %w", path, jerr)
+	jerr := json.Unmarshal(stripStart(body), &decoded)
+	env := decoded.apiEnvelope
+	if decoded.Code != nil {
+		env.Code = *decoded.Code
+	}
+	// A 401 may carry HTML or no body. Keep the status available to call so
+	// it can restore from passToken instead of failing during JSON decoding.
+	if resp.StatusCode == http.StatusUnauthorized || (jerr == nil && env.unauthorized(resp.StatusCode)) {
+		return &env, resp.StatusCode, nil
+	}
+	if resp.StatusCode != http.StatusOK {
+		if jerr != nil {
+			env = apiEnvelope{}
+		}
+		return nil, resp.StatusCode, &APIError{Endpoint: path, HTTPStatus: resp.StatusCode,
+			Code: env.Code, Reason: env.Reason, Description: env.Description}
+	}
+	if jerr != nil {
+		return nil, resp.StatusCode, fmt.Errorf("xiaomidrive: %s: decode response: %w", path, jerr)
+	}
+	if decoded.Code == nil {
+		return nil, resp.StatusCode, fmt.Errorf("xiaomidrive: %s: response missing code", path)
+	}
+	// Accept replacement credentials only from a validated successful response.
+	if env.Code == 0 {
+		if tok := setCookieValue(resp, "serviceToken"); tok != "" {
+			s.updateServiceToken(tok, setCookieValue(resp, "userId"))
 		}
 	}
 	return &env, resp.StatusCode, nil
